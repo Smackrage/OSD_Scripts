@@ -524,7 +524,7 @@ $objTextBox.Text = $compname
 
 $GeneralTab.Controls.Add($objTextBox)
 
-#Tooltip for computer name
+#Tooltip for computer name 
 $compTooltip = New-Object System.Windows.Forms.ToolTip
 $compToolTip.AutomaticDelay = 0
 $compToolTip.AutoPopDelay = '10000'
