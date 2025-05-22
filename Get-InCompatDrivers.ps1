@@ -11,6 +11,13 @@ Date: 22/05/2025
 Version: 1.0
 #>
 
+<#
+To do: 
+Update location of XML files
+Copy inf files to failed location on network
+
+#>
+
 # Function to log messages in CMTrace-compatible format
 function Write-Log {
     param (
