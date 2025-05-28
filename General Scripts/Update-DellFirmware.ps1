@@ -1,0 +1,21 @@
+#Runs on Dell command version 5.xx.xx
+
+$DCUCLI="C:\Program Files\Dell\CommandUpdate\dcu-cli.exe"
+
+& "$DCUCLI" /scan
+
+& "$DCUCLI" /applyupdates -reboot=disable -updateType='bios,firmware,driver'
+
+#& "$DCUCLI" /applyupdates -reboot=disable -updateType='driver'
+
+& "$DCUCLI" -outputlog=C:\windows\ccm\logs\Dell_Drivers.log
+
+start-sleep -seconds 15
+
+Remove-Item "C:\Users\Public\Desktop\Dell Command Configure Wizard.lnk" -ErrorAction SilentlyContinue | out-null
+
+start-sleep -seconds 15
+
+exit 0
+
+ 
