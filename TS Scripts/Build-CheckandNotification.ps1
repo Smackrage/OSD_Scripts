@@ -112,6 +112,9 @@ $Serial = (Get-WmiObject Win32_BIOS).SerialNumber
 # Retrieve the first non-null IP address of the system's network adapter
 $IP = (Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.IPAddress -ne $null }).IPAddress | Select-Object -First 1
 
+# Retrieve the name of the taks sequence currently running.
+$TSName =  $tsenv.Value("_SMSTSPackageName")
+
 # Determine the OSD start time based on the environment (Task Sequence or Full OS)
 $OSDStart = if ($RunningInTS) { $tsenv.Value("OSDStartTime") } else { $tsenv["OSDStartTime"] }
 
@@ -224,6 +227,9 @@ foreach ($line in $results) {
 $systemFactsArray = @(
     # Add the name of the computer system
     @{ name = "Name"; value = $Name },
+
+    # Add the name of the task sequence currently
+    @{ name = "Task Sequence"; value = $TSName },
     
     # Add the finish time of the build process
     @{ name = "Finished Time"; value = $FinishTime },
