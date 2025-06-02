@@ -186,7 +186,7 @@ foreach ($check in $checks) {
 if ($fail) {
     # If a failure was detected during validation
     # Set the webhook URL for failure notifications
-    $webhookUri = 'https://virginaustralia.webhook.office.com/webhookb2/42c0a175-845f-4600-a9d4-ae95d881d3b8@0f289d43-bbef-4446-9cec-57d0419a15c2/IncomingWebhook/2966bf057f694df6a68435cf82026c34/d176b296-b098-44ad-8053-2d61c7625bdb/V2pZs--yTd0OiSsCC35krwGg8l2TQGQSpUqnyqchTKgmA1'
+    $webhookUri = 'https://COMPANYNAME.webhook.office.com/webhookb2/42c0a175-845f-4600-a9d4-ae95d881d3b8@0f289d43-bbef-4446-9cec-57d0419a15c2/IncomingWebhook/2966bf057f694df6a68435cf82026c34/d176b296-b098-44ad-8053-2d61c7625bdb/V2pZs--yTd0OiSsCC35krwGg8l2TQGQSpUqnyqchTKgmA1'
     # Set the Teams notification card title to indicate a failed build
     $cardTitle = "**[X] Build Failed [X]**"
     # Set the card theme color to red to indicate an error
@@ -196,7 +196,7 @@ if ($fail) {
 } else {
     # If no failure was detected
     # Set the webhook URL for success notifications
-    $webhookUri = 'https://virginaustralia.webhook.office.com/webhookb2/42c0a175-845f-4600-a9d4-ae95d881d3b8@0f289d43-bbef-4446-9cec-57d0419a15c2/IncomingWebhook/2cfdbd959f7044d0a2af95cd30c2564b/d176b296-b098-44ad-8053-2d61c7625bdb/V2ZuNxa2N-Xrkrsirit5a4j0RDU3WAs1oml4MdGPzl0ZQ1'
+    $webhookUri = 'https://COMPANYNAME.webhook.office.com/webhookb2/42c0a175-845f-4600-a9d4-ae95d881d3b8@0f289d43-bbef-4446-9cec-57d0419a15c2/IncomingWebhook/2cfdbd959f7044d0a2af95cd30c2564b/d176b296-b098-44ad-8053-2d61c7625bdb/V2ZuNxa2N-Xrkrsirit5a4j0RDU3WAs1oml4MdGPzl0ZQ1'
     # Set the Teams notification card title to indicate a successful build
     $cardTitle = "**[OK] Build Successful [OK]**"
     # Set the card theme color to green to indicate success
