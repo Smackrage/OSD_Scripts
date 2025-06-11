@@ -1,12 +1,12 @@
 WITH IPData AS (
     SELECT
-        SYS.Netbios_Name0 AS 'Device Name',
+        SYST.Netbios_Name0 AS 'Device Name',
         NAC.IPAddress0 AS 'IP Address',
-        ROW_NUMBER() OVER (PARTITION BY SYS.ResourceID ORDER BY NAC.IPAddress0) AS RN
+        ROW_NUMBER() OVER (PARTITION BY SYST.ResourceID ORDER BY NAC.IPAddress0) AS RN
     FROM
         v_GS_NETWORK_ADAPTER_CONFIGUR NAC
     INNER JOIN
-        v_R_System SYS ON NAC.ResourceID = SYS.ResourceID
+        v_R_System SYST ON NAC.ResourceID = SYST.ResourceID
     WHERE
         NAC.IPEnabled0 = 1
         AND NAC.IPAddress0 IS NOT NULL
