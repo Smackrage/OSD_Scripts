@@ -68,9 +68,8 @@ Function Logwrite () {
      $logpath = $tsenv.Value("_SMSTSLogPath")
     # $logfile = '.\SMSTS_OSD_Checks.log'
      $logfile = Join-Path -Path $logPath -ChildPath $logname
-     Add-Content $logfile -Value "$time - $logstring"
-     Write-Host "$time - $logstring"
-     Add-Content $logfile -Value $logstring
+    Add-Content $logfile -Value "$time - $logstring"
+    Write-Host "$time - $logstring"
 }
 
 $TSEnv = New-Object -ComObject Microsoft.SMS.TSEnvironment   
