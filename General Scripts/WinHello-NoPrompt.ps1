@@ -4,7 +4,7 @@ Sets the Windows Hello for Business post-logon provisioning policy.
 
 .DESCRIPTION
 This script sets the registry value:
-HKLM\SOFTWARE\Policies\Microsoft\PassportForWork\DisablePostLogonProvisioning = 0
+HKLM\SOFTWARE\Policies\Microsoft\PassportForWork\DisablePostLogonProvisioning = 1
 
 Includes CMTrace-compatible logging and is designed to run in an SCCM Task Sequence.
 
