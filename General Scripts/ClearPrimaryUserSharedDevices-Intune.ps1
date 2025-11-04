@@ -6,6 +6,10 @@ then (optionally) clear their Intune primary users.
 .PARAMETER WhatIf
 Simulate the run without performing any Graph write actions.
 
+.Example
+Safe test (no changes)                     - .\Find-MultiUserDevices.ps1 -WhatIf
+Live mode (performs Intune user clears)    - .\Find-MultiUserDevices.ps1      
+
 .NOTES
 Author: Martin Smith (Data#3)
 Date: 04/11/2025
