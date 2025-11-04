@@ -1,20 +1,22 @@
 <#
 .SYNOPSIS
 Run a Defender Advanced Hunting query via Graph to find devices with ≥ 5 distinct users,
-then pass those devices into subsequent automation (e.g. Intune primary user clearing).
+then (optionally) clear their Intune primary users.
+
+.PARAMETER WhatIf
+Simulate the run without performing any Graph write actions.
 
 .NOTES
 Author: Martin Smith (Data#3)
 Date: 04/11/2025
-Version: 1.0
+Version: 1.1
 #>
 
+param (
+    [switch]$WhatIf
+)
+
 #Requires -Modules Microsoft.Graph, Microsoft.Graph.Security, Microsoft.Graph.DeviceManagement
-
-Install-Module Microsoft.Graph -Scope AllUsers
-Install-Module Microsoft.Graph.Security
-Install-Module Microsoft.Graph.DeviceManagement
-
 
 #region --- Logging Setup (CMTrace-compatible) ---
 function Write-Log {
@@ -71,44 +73,44 @@ DeviceLogonEvents
 
 Write-Log "Running Advanced Hunting query in Microsoft 365 Defender..." 1
 try {
-    $result = Invoke-MgSecurityHuntingQuery -Query $query
+    $result  = Invoke-MgSecurityHuntingQuery -Query $query
     $Devices = $result.Results
     if (-not $Devices) {
-        Write-Log "No devices found with more than 5 users in the last 30 days." 2
+        Write-Log "No devices found with ≥5 users in the last 30 days." 2
         return
     }
     Write-Log "Found $($Devices.Count) candidate devices with ≥5 users." 1
 } catch {
-    Write-Log "Failed to run Defender Advanced Hunting query: $($_.Exception.Message)" 3
+    Write-Log "Failed to run Defender query: $($_.Exception.Message)" 3
     return
 }
 #endregion
 
-#region --- Example: Use Devices for Next Steps (Intune) ---
+#region --- Process Each Device (Optionally Modify Intune) ---
 foreach ($Device in $Devices) {
     $DeviceName = $Device.DeviceName
     Write-Log "Processing device: $DeviceName" 1
 
     try {
-        # Example: retrieve the Intune managed device object
         $IntuneDevice = Get-MgDeviceManagementManagedDevice -Filter "deviceName eq '$DeviceName'"
-
         if ($IntuneDevice) {
-            # Example: Clear Primary User (only if one exists)
             $UserCount = ($IntuneDevice.UsersPrincipalNames).Count
             if ($UserCount -gt 0) {
-                Write-Log "Clearing Primary User for $DeviceName..." 1
-                # This endpoint requires beta profile (which we’ve selected)
-                Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$($IntuneDevice.Id)/users/deleteAllDeviceUsers"
-                Write-Log "Cleared Primary User for $DeviceName." 1
+                if ($WhatIf) {
+                    Write-Log "[WhatIf] Would clear Primary User for $DeviceName (currently $UserCount user(s))." 2
+                } else {
+                    Write-Log "Clearing Primary User for $DeviceName..." 1
+                    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$($IntuneDevice.Id)/users/deleteAllDeviceUsers"
+                    Write-Log "Cleared Primary User for $DeviceName." 1
+                }
             } else {
-                Write-Log "$DeviceName has no assigned primary user; skipping." 1
+                Write-Log "$DeviceName has no assigned Primary User; skipping." 1
             }
         } else {
             Write-Log "Device $DeviceName not found in Intune." 2
         }
     } catch {
-        Write-Log "Error processing $DeviceName : $($_.Exception.Message)" 3
+        Write-Log "Error processing $DeviceName: $($_.Exception.Message)" 3
     }
 }
 #endregion
