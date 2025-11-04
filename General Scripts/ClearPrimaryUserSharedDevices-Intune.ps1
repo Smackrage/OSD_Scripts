@@ -57,28 +57,39 @@ function Install-GraphModules {
     [CmdletBinding()]
     param()
 
+    # Only the lightweight submodules you actually need
     $modules = @(
-        'Microsoft.Graph',
+        'Microsoft.Graph.Authentication',
         'Microsoft.Graph.Security',
         'Microsoft.Graph.DeviceManagement'
     )
 
     foreach ($mod in $modules) {
-        $installed = Get-Module -ListAvailable -Name $mod
-        if (-not $installed) {
+        if (-not (Get-Module -ListAvailable -Name $mod)) {
             Write-Log "Module $mod not found — installing..." 2
             try {
                 Install-Module $mod -Scope AllUsers -Force -AllowClobber -ErrorAction Stop
                 Write-Log "Successfully installed $mod." 1
             } catch {
-                Write-Log "Failed to install $mod : $($_.Exception.Message)" 3
+                Write-Log "Failed to install $mod: $($_.Exception.Message)" 3
                 throw
             }
         } else {
             Write-Log "Module $mod already installed." 1
         }
     }
+
+    # Import only the required modules (avoid importing the massive root module)
+    foreach ($mod in $modules) {
+        try {
+            Import-Module $mod -ErrorAction Stop
+            Write-Log "Imported module $mod." 1
+        } catch {
+            Write-Log "Failed to import $mod: $($_.Exception.Message)" 3
+        }
+    }
 }
+
 
 Write-Log "Checking for required Graph modules..." 1
 Install-GraphModules
