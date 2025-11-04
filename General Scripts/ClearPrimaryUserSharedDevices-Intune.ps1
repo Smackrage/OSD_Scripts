@@ -57,7 +57,7 @@ function Install-GraphModules {
                 Install-Module $mod -Scope AllUsers -Force -AllowClobber -ErrorAction Stop
                 Write-Log "Successfully installed $mod." 1
             } catch {
-                Write-Log "Failed to install $mod: $($_.Exception.Message)" 3
+                Write-Log "Failed to install $mod : $($_.Exception.Message)" 3
                 throw
             }
         } else {
