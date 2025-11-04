@@ -114,7 +114,7 @@ foreach ($Device in $Devices) {
             Write-Log "Device $DeviceName not found in Intune." 2
         }
     } catch {
-        Write-Log "Error processing $DeviceName: $($_.Exception.Message)" 3
+        Write-Log "Error processing $DeviceName : $($_.Exception.Message)" 3
     }
 }
 #endregion
