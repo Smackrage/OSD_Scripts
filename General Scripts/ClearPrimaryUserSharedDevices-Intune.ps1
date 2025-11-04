@@ -28,12 +28,26 @@ function Write-Log {
         [string]$Message,
         [ValidateSet("1","2","3")] [string]$Severity = "1"  # 1=Info,2=Warning,3=Error
     )
+
     $time = Get-Date -Format "HH:mm:ss.fff"
     $date = Get-Date -Format "MM-dd-yyyy"
     $component = "Find-MultiUserDevices"
-    $log = "<![LOG[$Message]LOG]!><time=""$time"" date=""$date"" component=""$component"" type=""$Severity"" thread=""$PID"" file="""">"
-    Write-Output $log
+    $logEntry = "<![LOG[$Message]LOG]!><time=""$time"" date=""$date"" component=""$component"" type=""$Severity"" thread=""$PID"" file="""">"
+
+    # Define log file path
+    $logPath = "C:\Windows\Temp\Find-MultiUserDevices.log"
+
+    # Write to console
+    Write-Output $logEntry
+
+    # Write to log file
+    try {
+        Add-Content -Path $logPath -Value $logEntry -Encoding UTF8
+    } catch {
+        Write-Warning "Failed to write to log file: $($_.Exception.Message)"
+    }
 }
+
 #endregion
 
 
