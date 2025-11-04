@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
 Run a Defender Advanced Hunting query via Graph to find devices with ≥ 5 distinct users,
@@ -19,7 +20,10 @@ Version: 1.1
 param (
     [switch]$WhatIf
 )
-
+<#
+##Requires -Modules Microsoft.Graph, Microsoft.Graph.Security, Microsoft.Graph.DeviceManagement
+#>
+#region --- Ensure Graph Modules Are Present ---
 
 
 #region --- Logging Setup (CMTrace-compatible) ---
@@ -51,13 +55,12 @@ function Write-Log {
 #endregion
 
 
-#Requires -Modules Microsoft.Graph, Microsoft.Graph.Security, Microsoft.Graph.DeviceManagement
-#region --- Ensure Graph Modules Are Present ---
+
 function Install-GraphModules {
     [CmdletBinding()]
     param()
 
-    # Only the lightweight submodules you actually need
+    # Install only minimal submodules (no bulk import)
     $modules = @(
         'Microsoft.Graph.Authentication',
         'Microsoft.Graph.Security',
@@ -71,7 +74,7 @@ function Install-GraphModules {
                 Install-Module $mod -Scope AllUsers -Force -AllowClobber -ErrorAction Stop
                 Write-Log "Successfully installed $mod." 1
             } catch {
-                Write-Log "Failed to install $mod: $($_.Exception.Message)" 3
+                Write-Log "Failed to install $mod : $($_.Exception.Message)" 3
                 throw
             }
         } else {
@@ -79,21 +82,18 @@ function Install-GraphModules {
         }
     }
 
-    # Import only the required modules (avoid importing the massive root module)
-    foreach ($mod in $modules) {
-        try {
-            Import-Module $mod -ErrorAction Stop
-            Write-Log "Imported module $mod." 1
-        } catch {
-            Write-Log "Failed to import $mod: $($_.Exception.Message)" 3
-        }
-    }
+    # No explicit Import-Module calls here — allow implicit autoloading instead
+    Write-Log "Graph modules verified. They will autoload as required." 1
 }
+
 
 
 Write-Log "Checking for required Graph modules..." 1
 Install-GraphModules
 #endregion
+
+
+
 
 #region --- Connect to Microsoft Graph ---
 Write-Log "Connecting to Microsoft Graph..." 1
