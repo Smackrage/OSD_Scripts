@@ -20,11 +20,6 @@ param (
     [switch]$WhatIf
 )
 
-#Requires -Modules Microsoft.Graph, Microsoft.Graph.Security, Microsoft.Graph.DeviceManagement
-
-Install-Module Microsoft.Graph -Scope AllUsers
-Install-Module Microsoft.Graph.Security
-Install-Module Microsoft.Graph.DeviceManagement
 
 
 #region --- Logging Setup (CMTrace-compatible) ---
@@ -39,6 +34,40 @@ function Write-Log {
     $log = "<![LOG[$Message]LOG]!><time=""$time"" date=""$date"" component=""$component"" type=""$Severity"" thread=""$PID"" file="""">"
     Write-Output $log
 }
+#endregion
+
+
+#Requires -Modules Microsoft.Graph, Microsoft.Graph.Security, Microsoft.Graph.DeviceManagement
+#region --- Ensure Graph Modules Are Present ---
+function Install-GraphModules {
+    [CmdletBinding()]
+    param()
+
+    $modules = @(
+        'Microsoft.Graph',
+        'Microsoft.Graph.Security',
+        'Microsoft.Graph.DeviceManagement'
+    )
+
+    foreach ($mod in $modules) {
+        $installed = Get-Module -ListAvailable -Name $mod
+        if (-not $installed) {
+            Write-Log "Module $mod not found — installing..." 2
+            try {
+                Install-Module $mod -Scope AllUsers -Force -AllowClobber -ErrorAction Stop
+                Write-Log "Successfully installed $mod." 1
+            } catch {
+                Write-Log "Failed to install $mod: $($_.Exception.Message)" 3
+                throw
+            }
+        } else {
+            Write-Log "Module $mod already installed." 1
+        }
+    }
+}
+
+Write-Log "Checking for required Graph modules..." 1
+Install-GraphModules
 #endregion
 
 #region --- Connect to Microsoft Graph ---
