@@ -22,6 +22,11 @@ param (
 
 #Requires -Modules Microsoft.Graph, Microsoft.Graph.Security, Microsoft.Graph.DeviceManagement
 
+Install-Module Microsoft.Graph -Scope AllUsers
+Install-Module Microsoft.Graph.Security
+Install-Module Microsoft.Graph.DeviceManagement
+
+
 #region --- Logging Setup (CMTrace-compatible) ---
 function Write-Log {
     param (
