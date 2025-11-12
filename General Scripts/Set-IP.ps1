@@ -1,169 +1,361 @@
 <#
-Fix-StartSearch.ps1  (Windows 11)
-- Resets Windows Search index (cleanly).
-- Re-registers key shell/system apps (Search, StartMenuExperienceHost, ShellExperienceHost).
-- Restarts shell & Windows Search service.
-- Optional SFC/DISM OS repair.
-- CMTrace-style logging to C:\Temp\logs\Fix_StartSearch.log
+.SYNOPSIS
+TCAS / IFE NIC configurator (SYSTEM context, fixed layout, Find Free/Random IP for IFE)
 
-USAGE (Run as Admin):
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Fix-StartSearch.ps1
-  # Optional repair:
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Fix-StartSearch.ps1 -RepairOS
+.DESCRIPTION
+- TCAS: 192.168.111.200/16 + GW 192.168.1.1 + DNS 8.8.8.8, 8.8.4.4
+- IFE: If route to 172.19/16 exists, scan for a free IP; else pick a random 172.19.X.Y
+- Opens inbound firewall TCP 2022 ("SSH-2022")
+- Reset returns adapter to DHCP (and DNS reset)
+- Adapter list shows only physical Ethernet adapters
+- Inline route indicator (shown only when IFE is selected)
+- Close button
+- Logs to C:\ProgramData\IPChanger
+- If link is down: Retry/Close prompt to “ensure the network cable is plugged into the Laptop
+
+.NOTES
+Author: Martin Smith (Data #3)
+Date: 13/10/2025
+Version: 2.0
 #>
 
-[CmdletBinding()]
-param(
-  [switch]$RepairOS
-)
-
-# ===== Guard: Admin =====
-$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-  Write-Host "Please run this script as Administrator." -ForegroundColor Yellow
-  exit 1
-}
-
-# ===== Logging (CMTrace-compatible) =====
-$LogRoot = "C:\Temp\logs"
-$LogFile = Join-Path $LogRoot "Fix_StartSearch.log"
-if (-not (Test-Path $LogRoot)) { New-Item -Path $LogRoot -ItemType Directory -Force | Out-Null }
-New-Item -Path $LogFile -ItemType File -Force | Out-Null
+#region ===== CMTrace-compatible logging =====
+$script:LogDir = "C:\ProgramData\IPChanger"
+try {
+    if (-not (Test-Path $script:LogDir)) { New-Item -Path $script:LogDir -ItemType Directory -Force | Out-Null }
+} catch { }
+$scriptName = if ($PSCommandPath) { [IO.Path]::GetFileNameWithoutExtension($PSCommandPath) } else { 'TCAS_IFE_Config' }
+$script:LogPath = Join-Path $script:LogDir ("$scriptName.log")
 
 function Write-Log {
-  param(
-    [Parameter(Mandatory)][string]$Message,
-    [ValidateSet('1','2','3')][string]$Severity = '1', # 1=Info,2=Warn,3=Error
-    [string]$Component = 'Fix-StartSearch'
-  )
-  $ts = Get-Date -Format "MM-dd-yyyy HH:mm:ss.fff"
-  "$ts,$PID,$Component,$Message,$Severity" | Out-File -FilePath $LogFile -Append -Encoding UTF8
-  if ($Severity -eq '3') { Write-Host $Message -ForegroundColor Red }
-  elseif ($Severity -eq '2') { Write-Host $Message -ForegroundColor Yellow }
-  else { Write-Host $Message }
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet(1,2,3)][int]$Severity = 1,
+        [string]$Component = $scriptName
+    )
+    $ts = Get-Date
+    $line = "<![LOG[$Message]LOG]!><time=""{0}"" date=""{1}"" component=""{2}"" context="""" type=""{3}"" thread="""" file="""">" -f $ts.ToString("HH:mm:ss.fff"), $ts.ToString("dd-MM-yyyy"), $Component, $Severity
+    try { $line | Out-File -FilePath $script:LogPath -Encoding default -Append } catch { }
+    $line | Write-Host
+}
+Write-Log "==== Script start ===="
+Write-Log "Log file: $script:LogPath"
+#endregion
+
+#region ===== Networking helpers =====
+function Get-PhysicalEthernetAdapters {
+    Write-Log "Enumerating physical Ethernet adapters..."
+    $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Status -ne 'Disabled' -and
+            $_.HardwareInterface -and
+            ($_.Name -match 'Ethernet' -or $_.InterfaceDescription -match 'Ethernet')
+        } |
+        Sort-Object ifIndex
+
+    $exclude = @('virtual','hyper-v','vmware','bluetooth','wi-fi','wifi','wlan','tunnel','wireless','loopback','container','npcap','docker','wsl','remote','rdp','wan')
+    $filtered = $adapters | Where-Object {
+        $n = $_.Name.ToLower(); $d = $_.InterfaceDescription.ToLower()
+        -not ($exclude | Where-Object { $n -like "*$_*" -or $d -like "*$_*" })
+    }
+    Write-Log "Found $($filtered.Count) physical Ethernet adapter(s)."
+    return $filtered
 }
 
-# ===== Helpers =====
-function Stop-ProcessSafe {
-  param([string[]]$Names)
-  foreach ($n in $Names) {
+function Remove-ExistingIPv4 { param([Parameter(Mandatory)][string]$Alias)
+    Get-NetIPAddress -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Remove-NetIPAddress -InputObject $_ -Confirm:$false -ErrorAction Stop; Write-Log "Removed IP $($_.IPAddress)/$($_.PrefixLength) on $Alias" }
+        catch { Write-Log "Failed removing IP $($_.IPAddress) on $Alias : $($_.Exception.Message)" 3 }
+    }
     try {
-      Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-      Write-Log "Stopped process: $n"
+        Get-NetRoute -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.NextHop -ne '0.0.0.0' } |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+function Set-IPv4Static {
+    param([Parameter(Mandatory)][string]$Alias,[Parameter(Mandatory)][string]$IPAddress,[Parameter(Mandatory)][int]$PrefixLength,[string]$DefaultGateway)
+    Remove-ExistingIPv4 -Alias $Alias
+    try {
+        $args = @{ InterfaceAlias = $Alias; IPAddress = $IPAddress; PrefixLength = $PrefixLength }
+        if ($DefaultGateway) { $args.DefaultGateway = $DefaultGateway }
+        New-NetIPAddress @args -ErrorAction Stop | Out-Null
+        Write-Log "Set $Alias to $IPAddress/$PrefixLength GW=$DefaultGateway"
     } catch {
-      Write-Log "Failed stopping process: $n -> $($_.Exception.Message)" '2'
+        Write-Log "Failed to set static IP on $Alias : $($_.Exception.Message)" 3
+        throw
     }
-  }
 }
 
-function ReRegister-SystemApp {
-  param([string]$FolderName) # e.g. Microsoft.Windows.Search
-  try {
-    $systemApps = Join-Path $env:WINDIR "SystemApps"
-    $folders = Get-ChildItem -Path $systemApps -Directory -ErrorAction SilentlyContinue |
-      Where-Object { $_.Name -like "$FolderName*" }
-    $manifest = $null
-    foreach ($folder in $folders) {
-      $manifestPath = Join-Path $folder.FullName "AppxManifest.xml"
-      if (Test-Path $manifestPath) {
-        $manifest = Get-Item $manifestPath
-        break
-      }
+function Reset-AdapterToDHCP { param([Parameter(Mandatory)][string]$Alias)
+    try {
+        Remove-ExistingIPv4 -Alias $Alias
+        Set-NetIPInterface -InterfaceAlias $Alias -Dhcp Enabled -ErrorAction Stop | Out-Null
+        Set-DnsClientServerAddress -InterfaceAlias $Alias -ResetServerAddresses -ErrorAction SilentlyContinue
+        Write-Log "Reset $Alias to DHCP + cleared DNS"
+    } catch { Write-Log "Failed to reset $Alias to DHCP: $($_.Exception.Message)" 3; throw }
+}
+
+function Test-IPInUse { param([Parameter(Mandatory)][string]$IPAddress,[int]$TimeoutSeconds=1)
+    try {
+        $pong = Test-Connection -ComputerName $IPAddress -Count 1 -Quiet -TimeoutSeconds $TimeoutSeconds -ErrorAction SilentlyContinue
+        if ($pong) { return $true }
+        $arp = arp -a | Select-String -SimpleMatch $IPAddress
+        return [bool]$arp
+    } catch { Write-Log "IP availability check error for $IPAddress : $($_.Exception.Message)" 2; return $true }
+}
+
+function Ensure-FirewallRule2022 {
+    $ruleName = "SSH-2022"
+    $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+    if (-not $rule) { New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 2022 -Profile Any | Out-Null; Write-Log "Created firewall rule '$ruleName' (TCP 2022)" }
+    else { Set-NetFirewallRule -DisplayName $ruleName -Enabled True -Action Allow | Out-Null; Write-Log "Ensured firewall rule '$ruleName' allows TCP 2022" }
+}
+
+function Has-RouteTo17219 {
+    try {
+        $r = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.DestinationPrefix -eq '172.19.0.0/16' -or ($_.DestinationPrefix -like '172.19.*') }
+        return [bool]$r
+    } catch { return $false }
+}
+
+# NEW: adapter link check + Retry/Close prompt
+function Ensure-AdapterConnected {
+    param([Parameter(Mandatory)][string]$Alias)
+    try {
+        $na = Get-NetAdapter -Name $Alias -ErrorAction Stop
+        $disconnected = ($na.Status -eq 'Disconnected' -or $na.MediaConnectionState -eq 'Disconnected')
+    } catch {
+        # If cannot read adapter, treat as disconnected
+        $disconnected = $true
     }
-    if ($manifest) {
-      Add-AppxPackage -DisableDevelopmentMode -Register $manifest.FullName -ErrorAction Stop
-      Write-Log "Re-registered $FolderName"
-    } else {
-      Write-Log "Manifest not found for $FolderName" '2'
+
+    while ($disconnected) {
+        Write-Log "Adapter '$Alias' appears disconnected."
+        $msg = "The selected network adapter appears to be disconnected.`r`n`r`nEnsure the network cable is plugged into the device and aircraft."
+        $result = [System.Windows.Forms.MessageBox]::Show($msg,"Network link not detected",[System.Windows.Forms.MessageBoxButtons]::RetryCancel,[System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($result -eq [System.Windows.Forms.DialogResult]::Retry) {
+            Start-Sleep -Milliseconds 800
+            try {
+                $na = Get-NetAdapter -Name $Alias -ErrorAction Stop
+                $disconnected = ($na.Status -eq 'Disconnected' -or $na.MediaConnectionState -eq 'Disconnected')
+            } catch { $disconnected = $true }
+        } else {
+            return $false  # user chose Close/Cancel
+        }
     }
-  } catch {
-    Write-Log "Re-register failed for $FolderName -> $($_.Exception.Message)" '2'
-  }
+    return $true
+}
+#endregion
+
+#region ===== GUI =====
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "TCAS / IFE NIC Configurator"
+$form.StartPosition = 'CenterScreen'
+$form.Size = New-Object System.Drawing.Size(680,395)
+$form.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+$form.MaximizeBox = $false
+$form.FormBorderStyle = 'FixedDialog'
+$form.Topmost = $true
+
+$lblAdapter = New-Object System.Windows.Forms.Label
+$lblAdapter.Text = "Select physical Ethernet adapter:"
+$lblAdapter.Location = New-Object System.Drawing.Point(20,20)
+$lblAdapter.AutoSize = $true
+$form.Controls.Add($lblAdapter)
+
+$cmbAdapter = New-Object System.Windows.Forms.ComboBox
+$cmbAdapter.DropDownStyle = 'DropDownList'
+$cmbAdapter.Location = New-Object System.Drawing.Point(20,45)
+$cmbAdapter.Width = 620
+$form.Controls.Add($cmbAdapter)
+
+$lblAdapterStatus = New-Object System.Windows.Forms.Label
+$lblAdapterStatus.Location = New-Object System.Drawing.Point(20,70)
+$lblAdapterStatus.AutoSize = $true
+$form.Controls.Add($lblAdapterStatus)
+
+$grpMode = New-Object System.Windows.Forms.GroupBox
+$grpMode.Text = "Mode"
+$grpMode.Location = New-Object System.Drawing.Point(20,95)
+$grpMode.Size = New-Object System.Drawing.Size(280,120)
+$form.Controls.Add($grpMode)
+
+$rbTCAS = New-Object System.Windows.Forms.RadioButton
+$rbTCAS.Text = "TCAS"
+$rbTCAS.Location = New-Object System.Drawing.Point(15,25)
+$rbTCAS.Checked = $true
+$grpMode.Controls.Add($rbTCAS)
+
+$rbIFE = New-Object System.Windows.Forms.RadioButton
+$rbIFE.Text = "IFE"
+$rbIFE.Location = New-Object System.Drawing.Point(15,60)
+$grpMode.Controls.Add($rbIFE)
+
+$grpIFE = New-Object System.Windows.Forms.GroupBox
+$grpIFE.Text = "IFE Address"
+$grpIFE.Location = New-Object System.Drawing.Point(320,95)
+$grpIFE.Size = New-Object System.Drawing.Size(320,120)
+$form.Controls.Add($grpIFE)
+
+$btnFind = New-Object System.Windows.Forms.Button
+$btnFind.Text = "Find free IP"
+$btnFind.Location = New-Object System.Drawing.Point(15,25)
+$btnFind.Size = New-Object System.Drawing.Size(100,30)
+$grpIFE.Controls.Add($btnFind)
+
+$lblChosen = New-Object System.Windows.Forms.Label
+$lblChosen.Text = "Chosen IP: (none)"
+$lblChosen.Location = New-Object System.Drawing.Point(15,70)
+$lblChosen.AutoSize = $true
+$grpIFE.Controls.Add($lblChosen)
+
+# Route status label (only visible when IFE is selected)
+$lblRouteStatus = New-Object System.Windows.Forms.Label
+$lblRouteStatus.Location = New-Object System.Drawing.Point(20,220)
+$lblRouteStatus.AutoSize = $true
+$lblRouteStatus.Visible = $false
+$form.Controls.Add($lblRouteStatus)
+
+$btnApply = New-Object System.Windows.Forms.Button
+$btnApply.Text = "Apply"
+$btnApply.Location = New-Object System.Drawing.Point(320,230)
+$btnApply.Size = New-Object System.Drawing.Size(100,35)
+$form.Controls.Add($btnApply)
+
+$btnReset = New-Object System.Windows.Forms.Button
+$btnReset.Text = "Reset"
+$btnReset.Location = New-Object System.Drawing.Point(440,230)
+$btnReset.Size = New-Object System.Drawing.Size(100,35)
+$form.Controls.Add($btnReset)
+
+$btnClose = New-Object System.Windows.Forms.Button
+$btnClose.Text = "Close"
+$btnClose.Location = New-Object System.Drawing.Point(560,230)
+$btnClose.Size = New-Object System.Drawing.Size(80,35)
+$form.Controls.Add($btnClose)
+
+$txtLog = New-Object System.Windows.Forms.TextBox
+$txtLog.Multiline = $true
+$txtLog.ReadOnly = $true
+$txtLog.ScrollBars = 'Vertical'
+$txtLog.Location = New-Object System.Drawing.Point(20,280)
+$txtLog.Size = New-Object System.Drawing.Size(640,70)
+$form.Controls.Add($txtLog)
+
+function Append-UiLog([string]$msg) { $ts = Get-Date -Format "HH:mm:ss"; $txtLog.AppendText("[$ts] $msg`r`n") }
+
+function Update-IFEEnabled { $grpIFE.Enabled = $rbIFE.Checked }
+
+# Route status only when IFE is selected
+function Update-RouteStatus {
+    if (-not $rbIFE.Checked) { $lblRouteStatus.Visible = $false; return }
+    $lblRouteStatus.Visible = $true
+    if (Has-RouteTo17219) { $lblRouteStatus.ForeColor = 'Green'; $lblRouteStatus.Text = "172.19/16 route detected: Yes (will scan for free IPs)" }
+    else { $lblRouteStatus.ForeColor = 'DarkOrange'; $lblRouteStatus.Text = "172.19/16 route detected: No (will pick random IP)" }
 }
 
-# ===== Start =====
-Write-Log "=== Fix Start/Search: begin ==="
+$rbTCAS.Add_CheckedChanged({ Update-IFEEnabled; Update-RouteStatus })
+$rbIFE.Add_CheckedChanged({ Update-IFEEnabled; Update-RouteStatus })
+Update-IFEEnabled
 
-# 1) Stop Windows Search service + related processes
-try {
-  Write-Log "Stopping WSearch service..."
-  try {
-    Stop-Service -Name WSearch -Force -ErrorAction Stop
-    Write-Log "WSearch service stopped."
-  } catch {
-    Write-Log "Failed to stop WSearch service -> $($_.Exception.Message)" '2'
-  }
-  Stop-ProcessSafe -Names @('SearchHost','StartMenuExperienceHost','ShellExperienceHost','SearchApp','RuntimeBroker','explorer')
-} catch {
-  Write-Log "Error while stopping components -> $($_.Exception.Message)" '2'
+$adapters = Get-PhysicalEthernetAdapters
+if ($adapters) {
+    $adapters | ForEach-Object { $cmbAdapter.Items.Add($_.Name) }
+    $cmbAdapter.SelectedIndex = 0
+    $lblAdapterStatus.ForeColor = 'Gray'
+    $lblAdapterStatus.Text = "Adapters detected: " + ($adapters.Name -join ', ')
+} else {
+    $lblAdapterStatus.ForeColor = 'Red'
+    $lblAdapterStatus.Text = "No physical Ethernet adapters found."
+    $grpMode.Enabled = $false; $grpIFE.Enabled = $false; $btnApply.Enabled = $false; $btnReset.Enabled = $false
+}
+Update-RouteStatus
+#endregion
+
+#region ===== IFE finder & buttons =====
+$script:IFE_SelectedIP = $null
+
+function Get-RandomHostIn17219 { $rnd = New-Object System.Random; $x=$rnd.Next(0,256); $y=$rnd.Next(10,251); return "172.19.$x.$y" }
+function Get-RandomisedOctets { $arr=0..255; $rand=New-Object System.Random; ,($arr | Sort-Object { $rand.Next() }) }
+
+function Find-FreeIFEIP {
+    if (-not (Has-RouteTo17219)) { return Get-RandomHostIn17219 }
+    $thirds = Get-RandomisedOctets
+    foreach ($x in $thirds) { for ($y=10; $y -le 250; $y++) { $candidate="172.19.$x.$y"; if (-not (Test-IPInUse -IPAddress $candidate)) { return $candidate } } }
+    return $null
 }
 
-# 2) Reset the Search index store (clean rebuild)
-$SearchRoot = "C:\ProgramData\Microsoft\Search"
-$AppsPath   = Join-Path $SearchRoot "Data\Applications\Windows"
-$TempPath   = Join-Path $SearchRoot "Data\Temp"
-$stamp      = (Get-Date).ToString('yyyyMMdd_HHmmss')
+$btnFind.Add_Click({
+    $alias = $cmbAdapter.SelectedItem
+    if (-not $alias) { Append-UiLog "Select an adapter first."; return }
+    # Check link before scanning
+    if (-not (Ensure-AdapterConnected -Alias $alias)) { Append-UiLog "User cancelled due to link not detected."; return }
+    Append-UiLog "Searching for IFE IP..."
+    Update-RouteStatus
+    try {
+        $ip = Find-FreeIFEIP
+        if ($ip) { $script:IFE_SelectedIP = $ip; $lblChosen.Text = "Chosen IP: $ip"; Append-UiLog "Selected IFE IP: $ip" }
+        else { Append-UiLog "No free IP found." }
+    } catch {
+        $msg = $_.Exception.Message
+        Write-Log "IFE find failed: $msg" 3
+        # If it smells like a link issue, offer Retry/Close
+        if ($msg -match 'media|disconnected|unplug|cable') {
+            if (Ensure-AdapterConnected -Alias $alias) { Append-UiLog "Link restored; please click 'Find free IP' again." }
+            else { Append-UiLog "Operation cancelled."; return }
+        } else { Append-UiLog "Error: $msg" }
+    }
+})
 
-try {
-  if (Test-Path $AppsPath) {
-    $backup = "$AppsPath.bak_$stamp"
-    Write-Log "Backing up index store to $backup"
-    Rename-Item -Path $AppsPath -NewName (Split-Path $backup -Leaf) -ErrorAction Stop
-  }
-  if (Test-Path $TempPath) {
-    Remove-Item -Path $TempPath -Recurse -Force -ErrorAction SilentlyContinue
-  }
-  Write-Log "Search index store reset queued (will rebuild on service start)."
-} catch {
-  Write-Log "Index store reset error -> $($_.Exception.Message)" '2'
-}
+$btnApply.Add_Click({
+    $alias = $cmbAdapter.SelectedItem
+    if (-not $alias) { Append-UiLog "Select an adapter first."; return }
+    # Check link before applying (useful especially for IFE)
+    if (-not (Ensure-AdapterConnected -Alias $alias)) { Append-UiLog "User cancelled due to link not detected."; return }
+    try {
+        if ($rbTCAS.Checked) {
+            Append-UiLog "Applying TCAS on $alias..."
+            Set-IPv4Static -Alias $alias -IPAddress "192.168.111.200" -PrefixLength 16 -DefaultGateway "192.168.1.1"
+            try { Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses @("8.8.8.8","8.8.4.4") -ErrorAction Stop; Write-Log "Set DNS on $alias to 8.8.8.8, 8.8.4.4"; Append-UiLog "DNS set to 8.8.8.8, 8.8.4.4" }
+            catch { Write-Log "Failed to set DNS on $alias : $($_.Exception.Message)" 2; Append-UiLog "Warning: failed to set DNS ($($_.Exception.Message))" }
+            
+        } else {
+            if (-not $script:IFE_SelectedIP) { Append-UiLog "Click 'Find free IP' first."; return }
+            Append-UiLog "Applying IFE on $alias..."
+            Set-IPv4Static -Alias $alias -IPAddress $script:IFE_SelectedIP -PrefixLength 16
+            Ensure-FirewallRule2022
+            Append-UiLog "IFE applied. Firewall TCP 2022 open."
+        }
+        Update-RouteStatus
+    } catch {
+        $msg = $_.Exception.Message
+        Write-Log "Apply failed: $msg" 3
+        # Link-related error → Retry/Close
+        if ($msg -match 'media|disconnected|unplug|cable') {
+            if (Ensure-AdapterConnected -Alias $alias) { Append-UiLog "Link restored; please click Apply again." }
+            else { Append-UiLog "Operation cancelled."; return }
+        } else {
+            Append-UiLog "Apply failed: $msg"
+        }
+    }
+})
 
-# 3) Re-register core system apps tied to Start/Search (SystemApps, not user Appx)
-ReRegister-SystemApp -FolderName "Microsoft.Windows.Search"
-ReRegister-SystemApp -FolderName "Microsoft.Windows.StartMenuExperienceHost"
-ReRegister-SystemApp -FolderName "Microsoft.Windows.ShellExperienceHost"
+$btnReset.Add_Click({
+    $alias = $cmbAdapter.SelectedItem
+    if (-not $alias) { Append-UiLog "Select an adapter first."; return }
+    if (-not (Ensure-AdapterConnected -Alias $alias)) { Append-UiLog "User cancelled due to link not detected."; return }
+    try { Reset-AdapterToDHCP -Alias $alias; Append-UiLog "Adapter reset to DHCP."; Update-RouteStatus }
+    catch { Append-UiLog "Reset failed: $($_.Exception.Message)" }
+})
 
-# 4) Restart Windows Search service
-try {
-  Set-Service -Name WSearch -StartupType Automatic
-  Start-Service -Name WSearch
-  Write-Log "WSearch started."
-} catch {
-  Write-Log "Failed to start WSearch -> $($_.Exception.Message)" '3'
-}
+$btnClose.Add_Click({ Append-UiLog "User closed configurator."; Write-Log "User closed configurator."; $form.Close() })
+#endregion
 
-# 5) Restart Explorer (refresh Start & taskbar)
-try {
-  Start-Process explorer.exe
-  Write-Log "Explorer restarted."
-} catch {
-  Write-Log "Failed to restart Explorer -> $($_.Exception.Message)" '2'
-}
-
-# 6) Optional: OS health repair
-if ($RepairOS) {
-  try {
-    Write-Log "Starting DISM /RestoreHealth (this can take a while)..."
-    Start-Process -FilePath dism.exe -ArgumentList "/Online","/Cleanup-Image","/RestoreHealth" -Wait -NoNewWindow
-    Write-Log "DISM completed."
-
-    Write-Log "Starting SFC /scannow..."
-    Start-Process -FilePath sfc.exe -ArgumentList "/scannow" -Wait -NoNewWindow
-    Write-Log "SFC completed."
-  } catch {
-    Write-Log "OS repair step failed -> $($_.Exception.Message)" '2'
-  }
-}
-
-# 7) Quick sanity: confirm Search service & SearchHost are alive
-try {
-  $svc = Get-Service WSearch -ErrorAction SilentlyContinue
-  $proc = Get-Process -Name SearchHost -ErrorAction SilentlyContinue
-  $procIdStr = if ($proc) { ($proc.Id -join ',') } else { 'N/A' }
-  Write-Log ("Status -> WSearch:{0}, SearchHost PID:{1}" -f $svc.Status, $procIdStr)
-} catch {
-  Write-Log "Status check failed -> $($_.Exception.Message)" '2'
-}
-
-Write-Host "`nDone. If Search doesn't work immediately, give it a minute to rebuild the index. Log: $LogFile"
-exit 0
+Append-UiLog "Log file: $script:LogPath"
+[void]$form.ShowDialog()
