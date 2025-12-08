@@ -1,9 +1,3 @@
-diff --git a/General Scripts/Remove-AllDeviceAffinityForUser.ps1 b/General Scripts/Remove-AllDeviceAffinityForUser.ps1
-new file mode 100644
-index 0000000000000000000000000000000000000000..0a280d2a26bd15b07a7e441bbda71c1e9470da37
---- /dev/null
-+++ b/General Scripts/Remove-AllDeviceAffinityForUser.ps1	
-@@ -0,0 +1,121 @@
 +#Requires -Version 5.1
 +<#
 +.SYNOPSIS
