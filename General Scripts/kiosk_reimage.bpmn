@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+             xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+             xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+             id="Definitions_Kiosk_Reimage"
+             targetNamespace="http://example.com/bpmn">
+
+  <process id="KioskReimageProcess" name="Kiosk Reimage Process" isExecutable="false">
+
+    <!-- Lanes -->
+    <laneSet id="laneSet_1">
+      <lane id="lane_Tech" name="Technician"/>
+      <lane id="lane_AD" name="Active Directory"/>
+      <lane id="lane_MECM" name="MECM"/>
+      <lane id="lane_Device" name="Device"/>
+    </laneSet>
+
+    <!-- Start Event -->
+    <startEvent id="StartEvent" name="Start Reimage Process"/>
+    
+    <exclusiveGateway id="Gateway_Start" name="Trigger Type?"/>
+
+    <!-- Bare Metal Path -->
+    <userTask id="TS_Select" name="Select TS: Win11 25H2 - Kiosk + Training Builds"/>
+    <exclusiveGateway id="Gateway_KioskType" name="Choose Kiosk Type"/>
+    
+    <userTask id="Type_General" name="General Kiosk"/>
+    <userTask id="Type_Web" name="Web Kiosk"/>
+    <userTask id="Type_Board" name="Display Board"/>
+    <userTask id="Type_Flight" name="Flight Explorer"/>
+    <userTask id="Type_CCTV" name="CCTV"/>
+    <userTask id="Type_Training" name="Training Kiosk"/>
+
+    <serviceTask id="BareMetal_ApplyOSD" name="Apply OSD (Bare Metal)"/>
+    <endEvent id="End_BareMetal" name="Reimage Complete"/>
+
+    <!-- Zero Touch Path -->
+    <exclusiveGateway id="Gateway_OUCheck" name="In Kiosk/Display OU?"/>
+
+    <userTask id="OU_Add" name="Add Device to Kiosk/Display OU"/>
+    <intermediateCatchEvent id="Timer12hr" name="Wait 12 Hours">
+      <timerEventDefinition/>
+    </intermediateCatchEvent>
+
+    <userTask id="Add_ADGroup" name="Add to AD Group: MOE - KIOSK - MANDATORY BUILD"/>
+    <serviceTask id="MECM_Collection" name="Added to MECM Collection"/>
+    <serviceTask id="MECM_Autobuild" name="Auto Reimage Starts"/>
+    <serviceTask id="MECM_ReimageSameType" name="Reimage as Same Kiosk Type"/>
+    <endEvent id="End_ZeroTouch" name="Reimage Complete"/>
+
+    <!-- Software Center Reimage -->
+    <userTask id="SC_Reimage" name="User Reimage via Software Center (Existing Kiosk)"/>
+    <serviceTask id="SC_ApplyOSD" name="Apply OSD (Software Center)"/>
+    <endEvent id="End_SC" name="Reimage Complete"/>
+
+    <!-- Sequence Flows -->
+    <sequenceFlow id="SF1" sourceRef="StartEvent" targetRef="Gateway_Start"/>
+
+    <!-- Bare Metal Flow -->
+    <sequenceFlow id="SF2" sourceRef="Gateway_Start" targetRef="TS_Select" name="Bare Metal"/>
+    <sequenceFlow id="SF3" sourceRef="TS_Select" targetRef="Gateway_KioskType"/>
+
+    <sequenceFlow id="SF4" sourceRef="Gateway_KioskType" targetRef="Type_General" name="General"/>
+    <sequenceFlow id="SF5" sourceRef="Gateway_KioskType" targetRef="Type_Web" name="Web"/>
+    <sequenceFlow id="SF6" sourceRef="Gateway_KioskType" targetRef="Type_Board" name="Display Board"/>
+    <sequenceFlow id="SF7" sourceRef="Gateway_KioskType" targetRef="Type_Flight" name="Flight Explorer"/>
+    <sequenceFlow id="SF8" sourceRef="Gateway_KioskType" targetRef="Type_CCTV" name="CCTV"/>
+    <sequenceFlow id="SF9" sourceRef="Gateway_KioskType" targetRef="Type_Training" name="Training"/>
+
+    <sequenceFlow id="SF10" sourceRef="Type_General" targetRef="BareMetal_ApplyOSD"/>
+    <sequenceFlow id="SF11" sourceRef="Type_Web" targetRef="BareMetal_ApplyOSD"/>
+    <sequenceFlow id="SF12" sourceRef="Type_Board" targetRef="BareMetal_ApplyOSD"/>
+    <sequenceFlow id="SF13" sourceRef="Type_Flight" targetRef="BareMetal_ApplyOSD"/>
+    <sequenceFlow id="SF14" sourceRef="Type_CCTV" targetRef="BareMetal_ApplyOSD"/>
+    <sequenceFlow id="SF15" sourceRef="Type_Training" targetRef="BareMetal_ApplyOSD"/>
+
+    <sequenceFlow id="SF16" sourceRef="BareMetal_ApplyOSD" targetRef="End_BareMetal"/>
+
+    <!-- Zero Touch Flow -->
+    <sequenceFlow id="SF21" sourceRef="Gateway_Start" targetRef="Gateway_OUCheck" name="Zero Touch"/>
+    
+    <sequenceFlow id="SF22" sourceRef="Gateway_OUCheck" targetRef="OU_Add" name="No"/>
+    <sequenceFlow id="SF23" sourceRef="OU_Add" targetRef="Timer12hr"/>
+    <sequenceFlow id="SF24" sourceRef="Timer12hr" targetRef="Add_ADGroup"/>
+
+    <sequenceFlow id="SF25" sourceRef="Gateway_OUCheck" targetRef="Add_ADGroup" name="Yes"/>
+
+    <sequenceFlow id="SF26" sourceRef="Add_ADGroup" targetRef="MECM_Collection"/>
+    <sequenceFlow id="SF27" sourceRef="MECM_Collection" targetRef="MECM_Autobuild"/>
+    <sequenceFlow id="SF28" sourceRef="MECM_Autobuild" targetRef="MECM_ReimageSameType"/>
+    <sequenceFlow id="SF29" sourceRef="MECM_ReimageSameType" targetRef="End_ZeroTouch"/>
+
+    <!-- Software Center Flow -->
+    <sequenceFlow id="SF31" sourceRef="StartEvent" targetRef="SC_Reimage" name="Existing Device Reimage"/>
+    <sequenceFlow id="SF32" sourceRef="SC_Reimage" targetRef="SC_ApplyOSD"/>
+    <sequenceFlow id="SF33" sourceRef="SC_ApplyOSD" targetRef="End_SC"/>
+
+  </process>
+
+</definitions>
