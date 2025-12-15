@@ -319,11 +319,6 @@ $btnElevate.Add_Click({
 
 $btnInstallModules.Add_Click({
     try {
-        if ($worker.IsBusy) {
-            Add-UiLog "Install already running..." '2'
-            return
-        }
-
         $missing = Get-MissingGraphModules
         if (-not $missing -or $missing.Count -eq 0) {
             Add-UiLog "Graph modules already installed." '1'
@@ -333,9 +328,8 @@ $btnInstallModules.Add_Click({
         }
 
         if (-not (Test-IsAdmin)) {
-            Add-UiLog "Module install requires elevation. Click 'Restart as Administrator'." '2'
             [System.Windows.Forms.MessageBox]::Show(
-                "Installing Graph modules requires administrator privileges.`n`nClick 'Restart as Administrator' and try again.",
+                "Installing Graph modules requires administrator privileges.`n`nClick 'Restart as Administrator' first.",
                 "Elevation required",
                 "OK",
                 "Warning"
@@ -343,18 +337,66 @@ $btnInstallModules.Add_Click({
             return
         }
 
-        Add-UiLog ("Missing modules: " + ($missing -join ", ")) '2'
-        Add-UiLog "Starting module install worker..." '1'
         $btnInstallModules.Enabled = $false
-        $prgInstall.Value = 0
+        $prgInstall.Style = 'Marquee'
         Set-Status "Installing Graph modules..."
+        Add-UiLog "Starting Graph module install in separate PowerShell process..." '1'
 
-        $worker.RunWorkerAsync($missing)
+        $modules = $missing -join ','
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "powershell.exe"
+        $psi.Arguments = @"
+-NoProfile -ExecutionPolicy Bypass -Command `
+`"[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;
+Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop;
+Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue;
+Install-Module -Name $modules -Repository PSGallery -Scope AllUsers -Force -AllowClobber -Verbose;
+`"
+"@
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow  = $true
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+
+        while (-not $proc.HasExited) {
+            Start-Sleep -Milliseconds 200
+            if (-not $proc.StandardOutput.EndOfStream) {
+                $line = $proc.StandardOutput.ReadLine()
+                if ($line) { Add-UiLog "[VERBOSE] $line" '1' }
+            }
+            if (-not $proc.StandardError.EndOfStream) {
+                $err = $proc.StandardError.ReadLine()
+                if ($err) { Add-UiLog "[ERROR] $err" '3' }
+            }
+        }
+
+        if ($proc.ExitCode -ne 0) {
+            throw "Module install process failed with exit code $($proc.ExitCode)"
+        }
+
+        Add-UiLog "Graph module installation completed successfully." '1'
+        Import-GraphModules
+        Add-UiLog "Graph modules imported." '1'
+
+        $prgInstall.Style = 'Blocks'
+        $prgInstall.Value = 100
+        Set-Status "Ready (Graph installed)"
     }
     catch {
-        Add-UiLog ("Install click failed: " + $_.Exception.Message) '3'
+        Add-UiLog "Module install failed: $($_.Exception.Message)" '3'
         $btnInstallModules.Enabled = $true
+        $prgInstall.Style = 'Blocks'
+        $prgInstall.Value = 0
         Set-Status "Ready (modules missing)"
+        [System.Windows.Forms.MessageBox]::Show(
+            $_.Exception.Message,
+            "Module install failed",
+            "OK",
+            "Error"
+        ) | Out-Null
     }
 })
 #endregion
