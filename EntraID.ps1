@@ -2,12 +2,21 @@
 .SYNOPSIS
   Entra ID stale device cleanup (WinForms): install Graph modules, preview/count, export CSV, delete.
 
+.DESCRIPTION
+  - Form opens even if Microsoft Graph PowerShell modules are missing
+  - Install Graph modules button:
+      - runs module install in a separate powershell.exe process (avoids runspace issues)
+      - UI stays responsive (Timer polls stdout/stderr)
+      - verbose output streamed into UI log + CMTrace log
+  - Restart as Administrator button (UAC prompt)
+  - Preview/Export/Remove scaffolding included (Preview/Export/Remove require Graph modules + connection)
+
 .NOTES
   Author: Martin Smith (Data #3) + ChatGPT
   Date: 15/12/2025
 #>
 
-#region CMTrace Logging (FIXED time format for CMTrace parsing)
+#region CMTrace Logging (CMTrace time format fixed)
 function Write-CMLog {
     param(
         [Parameter(Mandatory)] [string]$Message,
@@ -21,8 +30,7 @@ function Write-CMLog {
 
         $now = Get-Date
 
-        # CMTrace is fussy: time needs timezone offset
-        # Example: 16:44:12.123+600  (Brisbane is +10 hours => +600 minutes)
+        # CMTrace wants timezone offset appended to time (minutes)
         $offsetMinutes = [int]([System.TimeZoneInfo]::Local.GetUtcOffset($now).TotalMinutes)
         $offsetSign = if ($offsetMinutes -ge 0) { '+' } else { '-' }
         $offsetAbs = [math]::Abs($offsetMinutes)
@@ -56,7 +64,6 @@ $VerbosePreference = 'Continue'
 #region UI + Helpers
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.ComponentModel
 
 function Test-IsAdmin {
     try {
@@ -158,7 +165,7 @@ function Set-Status([string]$text) {
     [System.Windows.Forms.Application]::DoEvents() | Out-Null
 }
 
-# Buffer log lines until handle exists
+# Buffer UI log lines until form handle exists
 $script:UiLogBuffer = New-Object System.Collections.Generic.List[string]
 
 function Add-UiLog {
@@ -186,7 +193,7 @@ $form.Add_Shown({
         $script:UiLogBuffer.Clear()
     }
 })
-#endregion
+#endregion UI + Helpers
 
 #region Graph helpers
 function Get-MissingGraphModules {
@@ -207,99 +214,71 @@ function Import-GraphModules {
 }
 #endregion
 
-#region BackgroundWorker install (FIXED: native .NET event handlers)
-$worker = New-Object System.ComponentModel.BackgroundWorker
-$worker.WorkerReportsProgress = $true
-$worker.WorkerSupportsCancellation = $false
+#region Non-blocking module install via child PowerShell process + Timer polling
+$script:InstallProcess = $null
+$script:InstallTimer   = New-Object System.Windows.Forms.Timer
+$script:InstallTimer.Interval = 250
 
-# DoWork
-$worker.add_DoWork([System.ComponentModel.DoWorkEventHandler]{
-    param($sender, $e)
+$script:InstallTimer.Add_Tick({
 
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    if (-not $script:InstallProcess) { return }
 
-    $missing = $e.Argument
-    if (-not $missing -or $missing.Count -eq 0) {
-        $sender.ReportProgress(100, "Nothing to install.")
-        return
-    }
-
-    # NuGet provider
-    if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-        $sender.ReportProgress(1, "Installing NuGet provider (verbose follows)...")
-        $out = (Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop -Verbose 4>&1)
-        foreach ($o in $out) { if ($o) { $sender.ReportProgress(1, "[VERBOSE] " + $o.ToString()) } }
-    }
-
-    # Trust PSGallery (avoid prompts)
+    # Drain stdout
     try {
-        $repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
-        if ($repo -and $repo.InstallationPolicy -ne 'Trusted') {
-            $sender.ReportProgress(2, "Setting PSGallery InstallationPolicy to Trusted (verbose follows)...")
-            $out = (Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop -Verbose 4>&1)
-            foreach ($o in $out) { if ($o) { $sender.ReportProgress(2, "[VERBOSE] " + $o.ToString()) } }
+        while (-not $script:InstallProcess.StandardOutput.EndOfStream) {
+            $line = $script:InstallProcess.StandardOutput.ReadLine()
+            if ($line) { Add-UiLog "[VERBOSE] $line" '1' }
         }
     } catch {
-        $sender.ReportProgress(2, "Could not set PSGallery trust (continuing): $($_.Exception.Message)")
+        Add-UiLog "StdOut read error: $($_.Exception.Message)" '2'
     }
 
-    $total = $missing.Count
-    $i = 0
-
-    foreach ($module in $missing) {
-        $i++
-        $pctBase = [int](($i - 1) / $total * 100)
-        $sender.ReportProgress($pctBase, "Installing $module ($i of $total)...")
-
-        $out = (Install-Module -Name $module -Repository PSGallery -Scope AllUsers -Force -AllowClobber -ErrorAction Stop -Verbose 4>&1)
-        foreach ($o in $out) { if ($o) { $sender.ReportProgress($pctBase, "$module [VERBOSE] " + $o.ToString()) } }
-
-        $sender.ReportProgress([int]($i / $total * 100), "Installed $module")
-    }
-})
-
-# ProgressChanged
-$worker.add_ProgressChanged([System.ComponentModel.ProgressChangedEventHandler]{
-    param($sender, $e)
-    $msg = [string]$e.UserState
-    if ($msg) { Add-UiLog $msg '1' }
-
-    $val = [int]$e.ProgressPercentage
-    if ($val -lt 0) { $val = 0 }
-    if ($val -gt 100) { $val = 100 }
-    $prgInstall.Value = $val
-})
-
-# RunWorkerCompleted
-$worker.add_RunWorkerCompleted([System.ComponentModel.RunWorkerCompletedEventHandler]{
-    param($sender, $e)
-
-    if ($e.Error) {
-        Add-UiLog ("Install failed: " + $e.Error.Message) '3'
-        [System.Windows.Forms.MessageBox]::Show($e.Error.Message, "Module install failed", "OK", "Error") | Out-Null
-        $prgInstall.Value = 0
-        $btnInstallModules.Enabled = $true
-        Set-Status "Ready (modules missing)"
-        return
-    }
-
-    Add-UiLog "Install complete. Importing modules..." '1'
+    # Drain stderr
     try {
-        Import-GraphModules
-        Add-UiLog "Modules imported successfully." '1'
+        while (-not $script:InstallProcess.StandardError.EndOfStream) {
+            $err = $script:InstallProcess.StandardError.ReadLine()
+            if ($err) { Add-UiLog "[ERROR] $err" '3' }
+        }
     } catch {
-        Add-UiLog ("Import failed: " + $_.Exception.Message) '3'
+        Add-UiLog "StdErr read error: $($_.Exception.Message)" '2'
     }
 
-    $btnInstallModules.Enabled = $false
-    $prgInstall.Value = 100
-    Set-Status "Ready (Graph installed)"
+    # Completed?
+    if ($script:InstallProcess.HasExited) {
+        $script:InstallTimer.Stop()
+
+        $exitCode = $script:InstallProcess.ExitCode
+        $script:InstallProcess.Dispose()
+        $script:InstallProcess = $null
+
+        $prgInstall.Style = 'Blocks'
+
+        if ($exitCode -ne 0) {
+            Add-UiLog "Module install failed (exit code $exitCode)" '3'
+            $btnInstallModules.Enabled = $true
+            $prgInstall.Value = 0
+            Set-Status "Ready (modules missing)"
+            return
+        }
+
+        Add-UiLog "Graph module installation completed successfully." '1'
+        try {
+            Import-GraphModules
+            Add-UiLog "Graph modules imported." '1'
+            $btnInstallModules.Enabled = $false
+            $prgInstall.Value = 100
+            Set-Status "Ready (Graph installed)"
+        } catch {
+            Add-UiLog "Install succeeded but import failed: $($_.Exception.Message)" '3'
+            $btnInstallModules.Enabled = $true
+            $prgInstall.Value = 0
+            Set-Status "Ready (modules missing)"
+        }
+    }
 })
 #endregion
 
-#region Main buttons
-$script:PreviewDevices = @()
-
+#region Main button handlers
 $btnElevate.Add_Click({
     try {
         Add-UiLog "Elevation requested. Relaunching as Administrator..." '2'
@@ -319,6 +298,11 @@ $btnElevate.Add_Click({
 
 $btnInstallModules.Add_Click({
     try {
+        if ($script:InstallProcess) {
+            Add-UiLog "Install already running..." '2'
+            return
+        }
+
         $missing = Get-MissingGraphModules
         if (-not $missing -or $missing.Count -eq 0) {
             Add-UiLog "Graph modules already installed." '1'
@@ -328,8 +312,9 @@ $btnInstallModules.Add_Click({
         }
 
         if (-not (Test-IsAdmin)) {
+            Add-UiLog "Module install requires elevation. Click 'Restart as Administrator'." '2'
             [System.Windows.Forms.MessageBox]::Show(
-                "Installing Graph modules requires administrator privileges.`n`nClick 'Restart as Administrator' first.",
+                "Installing Graph modules requires administrator privileges.`n`nClick 'Restart as Administrator' and try again.",
                 "Elevation required",
                 "OK",
                 "Warning"
@@ -337,67 +322,64 @@ $btnInstallModules.Add_Click({
             return
         }
 
+        Add-UiLog ("Missing modules: " + ($missing -join ", ")) '2'
+        Add-UiLog "Starting module install process (non-blocking)..." '1'
+
         $btnInstallModules.Enabled = $false
         $prgInstall.Style = 'Marquee'
+        $prgInstall.MarqueeAnimationSpeed = 30
+        $prgInstall.Value = 0
         Set-Status "Installing Graph modules..."
-        Add-UiLog "Starting Graph module install in separate PowerShell process..." '1'
 
-        $modules = $missing -join ','
+        $modulesCsv = ($missing -join ',')
+
+        # Child process runs installs in its own proper runspace
+        $cmd = @"
+`$ErrorActionPreference = 'Stop'
+`$VerbosePreference = 'Continue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+Write-Verbose "Ensuring NuGet provider..."
+Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+
+Write-Verbose "Setting PSGallery trust (best effort)..."
+try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue } catch {}
+
+Write-Verbose "Installing modules: $modulesCsv"
+Install-Module -Name $modulesCsv -Repository PSGallery -Scope AllUsers -Force -AllowClobber -Verbose
+
+Write-Verbose "Install complete."
+"@
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = "powershell.exe"
-        $psi.Arguments = @"
--NoProfile -ExecutionPolicy Bypass -Command `
-`"[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;
-Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop;
-Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue;
-Install-Module -Name $modules -Repository PSGallery -Scope AllUsers -Force -AllowClobber -Verbose;
-`"
-"@
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"& { $cmd }`""
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError  = $true
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow  = $true
 
-        $proc = [System.Diagnostics.Process]::Start($psi)
-
-        while (-not $proc.HasExited) {
-            Start-Sleep -Milliseconds 200
-            if (-not $proc.StandardOutput.EndOfStream) {
-                $line = $proc.StandardOutput.ReadLine()
-                if ($line) { Add-UiLog "[VERBOSE] $line" '1' }
-            }
-            if (-not $proc.StandardError.EndOfStream) {
-                $err = $proc.StandardError.ReadLine()
-                if ($err) { Add-UiLog "[ERROR] $err" '3' }
-            }
-        }
-
-        if ($proc.ExitCode -ne 0) {
-            throw "Module install process failed with exit code $($proc.ExitCode)"
-        }
-
-        Add-UiLog "Graph module installation completed successfully." '1'
-        Import-GraphModules
-        Add-UiLog "Graph modules imported." '1'
-
-        $prgInstall.Style = 'Blocks'
-        $prgInstall.Value = 100
-        Set-Status "Ready (Graph installed)"
+        $script:InstallProcess = [System.Diagnostics.Process]::Start($psi)
+        $script:InstallTimer.Start()
     }
     catch {
-        Add-UiLog "Module install failed: $($_.Exception.Message)" '3'
+        Add-UiLog "Failed to start install: $($_.Exception.Message)" '3'
         $btnInstallModules.Enabled = $true
         $prgInstall.Style = 'Blocks'
         $prgInstall.Value = 0
         Set-Status "Ready (modules missing)"
-        [System.Windows.Forms.MessageBox]::Show(
-            $_.Exception.Message,
-            "Module install failed",
-            "OK",
-            "Error"
-        ) | Out-Null
     }
+})
+
+# Stubs for your next step (kept disabled until Graph installed + you wire in your preview/removal logic)
+$btnPreview.Add_Click({
+    [System.Windows.Forms.MessageBox]::Show("Preview/Export/Remove logic not included in this 'installer-fix' version yet.", "Info", "OK", "Information") | Out-Null
+})
+$btnExport.Add_Click({
+    [System.Windows.Forms.MessageBox]::Show("Export requires preview results. Add your preview logic next.", "Info", "OK", "Information") | Out-Null
+})
+$btnRemove.Add_Click({
+    [System.Windows.Forms.MessageBox]::Show("Remove requires preview results. Add your removal logic next.", "Info", "OK", "Information") | Out-Null
 })
 #endregion
 
@@ -417,6 +399,9 @@ $missingAtStart = Get-MissingGraphModules
 if ($missingAtStart.Count -gt 0) {
     Add-UiLog ("Graph modules missing: " + ($missingAtStart -join ", ")) '2'
     $btnInstallModules.Enabled = $true
+    $btnPreview.Enabled = $false
+    $btnExport.Enabled  = $false
+    $btnRemove.Enabled  = $false
     Set-Status "Ready (modules missing)"
 } else {
     try {
@@ -426,9 +411,11 @@ if ($missingAtStart.Count -gt 0) {
         Add-UiLog ("Graph import error: " + $_.Exception.Message) '2'
     }
     $btnInstallModules.Enabled = $false
+    $btnPreview.Enabled = $true
+    $btnExport.Enabled  = $false
+    $btnRemove.Enabled  = $false
     Set-Status "Ready"
 }
-
 #endregion
 
 [void]$form.ShowDialog()
