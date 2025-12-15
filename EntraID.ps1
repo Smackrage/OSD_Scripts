@@ -5,6 +5,7 @@
 .DESCRIPTION
   - Form opens even if Microsoft Graph PowerShell modules are missing
   - Button to install missing Graph modules with progress + verbose output
+  - Button to restart the script as Administrator (UAC prompt)
   - Preview button shows target count + populates grid (devices older than X days based on ApproximateLastSignInDateTime)
   - Export CSV exports the preview set
   - Remove deletes the preview set from Entra ID with typed confirmation ("DELETE")
@@ -51,13 +52,11 @@ if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
 }
 #endregion
 
-# Always allow verbose. We'll capture it into the UI log as well.
 $VerbosePreference = 'Continue'
 
 #region UI + Helpers
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.ComponentModel
 
 function Test-IsAdmin {
     try {
@@ -115,12 +114,17 @@ $lblStatus.Location = New-Object System.Drawing.Point(15, 45)
 $btnInstallModules = New-Object System.Windows.Forms.Button
 $btnInstallModules.Text = "Install Graph Modules"
 $btnInstallModules.Width = 170
-$btnInstallModules.Location = New-Object System.Drawing.Point(300, 42)
+$btnInstallModules.Location = New-Object System.Drawing.Point(200, 42)
+
+$btnElevate = New-Object System.Windows.Forms.Button
+$btnElevate.Text = "Restart as Administrator"
+$btnElevate.Width = 190
+$btnElevate.Location = New-Object System.Drawing.Point(820, 42)
 
 $prgInstall = New-Object System.Windows.Forms.ProgressBar
 $prgInstall.Width = 420
 $prgInstall.Height = 18
-$prgInstall.Location = New-Object System.Drawing.Point(480, 45)
+$prgInstall.Location = New-Object System.Drawing.Point(380, 45)
 $prgInstall.Minimum = 0
 $prgInstall.Maximum = 100
 $prgInstall.Value = 0
@@ -147,7 +151,7 @@ $txtInstallLog.Location = New-Object System.Drawing.Point(15, 585)
 
 $form.Controls.AddRange(@(
     $lblDays,$numDays,$btnPreview,$btnExport,$btnRemove,$chkWhatIf,
-    $lblStatus,$btnInstallModules,$prgInstall,$grid,$txtInstallLog
+    $lblStatus,$btnInstallModules,$prgInstall,$btnElevate,$grid,$txtInstallLog
 ))
 
 function Set-Status([string]$text) {
@@ -155,27 +159,34 @@ function Set-Status([string]$text) {
     [System.Windows.Forms.Application]::DoEvents() | Out-Null
 }
 
+# Buffer log lines until handle exists
+$script:UiLogBuffer = New-Object System.Collections.Generic.List[string]
+
 function Add-UiLog {
     param(
         [Parameter(Mandatory)][string]$Text,
         [ValidateSet('1','2','3')][string]$Severity = '1'
     )
     $line = "[{0}] {1}" -f (Get-Date).ToString("HH:mm:ss"), $Text
-
-    # Log to CMTrace + UI
     Write-CMLog $Text $Severity
 
-    $form.BeginInvoke([Action]{
-        $txtInstallLog.AppendText($line + [Environment]::NewLine)
-    }) | Out-Null
+    if ($form.IsHandleCreated) {
+        $form.BeginInvoke([Action]{
+            $txtInstallLog.AppendText($line + [Environment]::NewLine)
+        }) | Out-Null
+    } else {
+        [void]$script:UiLogBuffer.Add($line)
+    }
 }
 
-function Set-GraphButtonsEnabled([bool]$enabled) {
-    $btnPreview.Enabled = $enabled
-    $btnExport.Enabled  = $enabled -and ($script:PreviewDevices.Count -gt 0)
-    $btnRemove.Enabled  = $enabled -and ($script:PreviewDevices.Count -gt 0)
-}
-
+$form.Add_Shown({
+    if ($script:UiLogBuffer.Count -gt 0) {
+        foreach ($l in $script:UiLogBuffer) {
+            $txtInstallLog.AppendText($l + [Environment]::NewLine)
+        }
+        $script:UiLogBuffer.Clear()
+    }
+})
 #endregion UI + Helpers
 
 #region Graph helpers
@@ -211,7 +222,6 @@ function Ensure-GraphConnection {
 
     if (-not $connected -or -not $hasScopes) {
         Add-UiLog ("Connecting to Microsoft Graph with scopes: " + ($needScopes -join ", ")) '1'
-        # Verbose capture
         $v = (Connect-MgGraph -Scopes $needScopes -ErrorAction Stop -Verbose 4>&1)
         foreach ($line in $v) {
             if ($line) { Add-UiLog ("[VERBOSE] " + ($line.ToString())) '1' }
@@ -240,7 +250,6 @@ function Get-StaleEntraDevices {
     $cutoff = (Get-Date).AddDays(-1 * $OlderThanDays)
     Add-UiLog "Cutoff date/time: $cutoff (older than $OlderThanDays days)" '1'
 
-    # Server-side filter attempt using Invoke-MgGraphRequest
     $iso = $cutoff.ToString("yyyy-MM-ddTHH:mm:ssZ")
     $filter = "approximateLastSignInDateTime le $iso"
     Add-UiLog "Attempting server-side Graph filter: $filter" '1'
@@ -248,31 +257,21 @@ function Get-StaleEntraDevices {
     try {
         $uri = "/devices?`$select=id,deviceId,displayName,accountEnabled,operatingSystem,operatingSystemVersion,trustType,approximateLastSignInDateTime&`$filter=$([uri]::EscapeDataString($filter))&`$top=999"
 
-        $all = New-Object System.Collections.Generic.List[object]
+        $all  = New-Object System.Collections.Generic.List[object]
         $next = $uri
 
         do {
-            $v = (Invoke-MgGraphRequest -Method GET -Uri $next -Headers @{ 'ConsistencyLevel'='eventual' } -ErrorAction Stop -Verbose 4>&1)
-            foreach ($line in $v) {
-                if ($line -and $line.PSObject.Properties.Name -contains 'value') {
-                    # This is the actual response object
-                    if ($line.value) { $line.value | ForEach-Object { [void]$all.Add($_) } }
-                    $next = $line.'@odata.nextLink'
-                } else {
-                    # Verbose text or other stream content
-                    if ($line) { Add-UiLog ("[VERBOSE] " + ($line.ToString())) '1' }
-                }
-            }
-
+            $resp = Invoke-MgGraphRequest -Method GET -Uri $next -Headers @{ 'ConsistencyLevel'='eventual' } -ErrorAction Stop
+            if ($resp.value) { $resp.value | ForEach-Object { [void]$all.Add($_) } }
+            $next = $resp.'@odata.nextLink'
             if ($next) { Add-UiLog "Paging nextLink..." '1' }
-
         } while ($next)
 
         Add-UiLog "Server-side returned $($all.Count) device(s)." '1'
         return ,$all
     }
     catch {
-        Add-UiLog "Server-side filter failed. Falling back to Get-MgDevice -All and client-side filter. Error: $($_.Exception.Message)" '2'
+        Add-UiLog "Server-side filter failed. Falling back to Get-MgDevice -All (slower). Error: $($_.Exception.Message)" '2'
 
         $v = (Get-MgDevice -All -Property "id,deviceId,displayName,accountEnabled,operatingSystem,operatingSystemVersion,trustType,approximateLastSignInDateTime" -ErrorAction Stop -Verbose 4>&1)
         $devices = @()
@@ -294,23 +293,24 @@ function Get-StaleEntraDevices {
 }
 #endregion Graph helpers
 
-#region BackgroundWorker: Install Graph Modules (with verbose)
+#region BackgroundWorker install (Register-ObjectEvent)
 $worker = New-Object System.ComponentModel.BackgroundWorker
 $worker.WorkerReportsProgress = $true
+$worker.WorkerSupportsCancellation = $false
 
-$worker.DoWork += {
-    param($sender, $e)
+Get-EventSubscriber | Where-Object { $_.SourceObject -eq $worker } | Unregister-Event -Force -ErrorAction SilentlyContinue
 
-    # Ensure TLS 1.2 for PSGallery
+Register-ObjectEvent -InputObject $worker -EventName DoWork -Action {
+    param($sender, $eventArgs)
+
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-    $missing = $e.Argument
+    $missing = $eventArgs.Argument
     if (-not $missing -or $missing.Count -eq 0) {
         $sender.ReportProgress(100, "Nothing to install.")
         return
     }
 
-    # NuGet provider (common first-run)
     try {
         if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
             $sender.ReportProgress(1, "Installing NuGet provider (verbose follows)...")
@@ -321,7 +321,6 @@ $worker.DoWork += {
         throw "Failed installing NuGet provider: $($_.Exception.Message)"
     }
 
-    # PSGallery trust (avoid prompts)
     try {
         $repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
         if ($repo -and $repo.InstallationPolicy -ne 'Trusted') {
@@ -343,37 +342,35 @@ $worker.DoWork += {
 
         try {
             $out = (Install-Module -Name $module -Repository PSGallery -Scope AllUsers -Force -AllowClobber -ErrorAction Stop -Verbose 4>&1)
+            foreach ($o in $out) { if ($o) { $sender.ReportProgress($pctBase, "$module [VERBOSE] " + $o.ToString()) } }
 
-            foreach ($o in $out) {
-                if ($o) { $sender.ReportProgress($pctBase, "$module [VERBOSE] " + $o.ToString()) }
-            }
-
-            $sender.ReportProgress([int]($i / $total * 100), "Installed $module")
+            $sender.ReportProgress([int]($i / $total * 100), "Installed $module"
+            )
         } catch {
             throw "FAILED to install $module : $($_.Exception.Message)"
         }
     }
-}
+} | Out-Null
 
-$worker.ProgressChanged += {
-    param($sender, $e)
+Register-ObjectEvent -InputObject $worker -EventName ProgressChanged -Action {
+    param($sender, $eventArgs)
 
-    $msg = [string]$e.UserState
+    $msg = [string]$eventArgs.UserState
     if ($msg) { Add-UiLog $msg '1' }
 
-    $val = [int]$e.ProgressPercentage
+    $val = [int]$eventArgs.ProgressPercentage
     if ($val -lt 0) { $val = 0 }
     if ($val -gt 100) { $val = 100 }
     $prgInstall.Value = $val
-}
+} | Out-Null
 
-$worker.RunWorkerCompleted += {
-    param($sender, $e)
+Register-ObjectEvent -InputObject $worker -EventName RunWorkerCompleted -Action {
+    param($sender, $eventArgs)
 
-    if ($e.Error) {
-        Add-UiLog ("Install failed: " + $e.Error.Message) '3'
+    if ($eventArgs.Error) {
+        Add-UiLog ("Install failed: " + $eventArgs.Error.Message) '3'
         [System.Windows.Forms.MessageBox]::Show(
-            $e.Error.Message,
+            $eventArgs.Error.Message,
             "Module install failed",
             "OK",
             "Error"
@@ -397,11 +394,34 @@ $worker.RunWorkerCompleted += {
     $prgInstall.Value = 100
     Set-GraphButtonsEnabled $true
     Set-Status "Ready (Graph installed)"
-}
+} | Out-Null
 #endregion
 
 #region Main button handlers
 $script:PreviewDevices = @()
+
+function Set-GraphButtonsEnabled([bool]$enabled) {
+    $btnPreview.Enabled = $enabled
+    $btnExport.Enabled  = $enabled -and ($script:PreviewDevices.Count -gt 0)
+    $btnRemove.Enabled  = $enabled -and ($script:PreviewDevices.Count -gt 0)
+}
+
+$btnElevate.Add_Click({
+    try {
+        Add-UiLog "Elevation requested. Relaunching as Administrator..." '2'
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "powershell.exe"
+        $psi.Arguments = "-STA -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        $psi.Verb = "runas"
+        $psi.UseShellExecute = $true
+
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
+        $form.Close()
+    } catch {
+        Add-UiLog "Elevation cancelled or failed: $($_.Exception.Message)" '2'
+    }
+})
 
 $btnInstallModules.Add_Click({
     try {
@@ -414,11 +434,14 @@ $btnInstallModules.Add_Click({
             return
         }
 
-        # Install requires admin for -Scope AllUsers
         if (-not (Test-IsAdmin)) {
-            $msg = "Module install requires an elevated PowerShell session (Run as Administrator) because we use -Scope AllUsers."
-            Add-UiLog $msg '2'
-            [System.Windows.Forms.MessageBox]::Show($msg, "Elevation required", "OK", "Warning") | Out-Null
+            Add-UiLog "Module install requires elevation. Click 'Restart as Administrator'." '2'
+            [System.Windows.Forms.MessageBox]::Show(
+                "Installing Graph modules requires administrator privileges.`n`nClick 'Restart as Administrator' and try again.",
+                "Elevation required",
+                "OK",
+                "Warning"
+            ) | Out-Null
             return
         }
 
@@ -499,7 +522,6 @@ $btnRemove.Add_Click({
 
         $count = $script:PreviewDevices.Count
 
-        # Confirmation dialog
         $confirm = New-Object System.Windows.Forms.Form
         $confirm.Text = "Confirm deletion"
         $confirm.Width = 520
@@ -556,7 +578,7 @@ $btnRemove.Add_Click({
         $failed  = 0
 
         foreach ($d in $script:PreviewDevices) {
-            $name = $d.DisplayName
+            $name  = $d.DisplayName
             $objId = $d.Id
             try {
                 if ($whatIf) {
@@ -589,12 +611,20 @@ $btnRemove.Add_Click({
 })
 #endregion
 
-#region Initial state (open UI even if prereqs missing)
+#region Initial state
 Add-UiLog "Launching UI..." '1'
-
 $script:PreviewDevices = @()
-$missingAtStart = Get-MissingGraphModules
 
+if (Test-IsAdmin) {
+    $btnElevate.Enabled = $false
+    $btnElevate.Text = "Running as Administrator"
+    Add-UiLog "Process is running elevated." '1'
+} else {
+    $btnElevate.Enabled = $true
+    Add-UiLog "Process is NOT running elevated. Module install will require elevation." '2'
+}
+
+$missingAtStart = Get-MissingGraphModules
 if ($missingAtStart.Count -gt 0) {
     Add-UiLog ("Graph modules missing: " + ($missingAtStart -join ", ")) '2'
     $btnInstallModules.Enabled = $true
@@ -605,7 +635,7 @@ if ($missingAtStart.Count -gt 0) {
         Import-GraphModules
         Add-UiLog "Graph modules present and imported." '1'
     } catch {
-        Add-UiLog ("Graph import error (install may still be required): " + $_.Exception.Message) '2'
+        Add-UiLog ("Graph import error: " + $_.Exception.Message) '2'
     }
     $btnInstallModules.Enabled = $false
     Set-GraphButtonsEnabled $true
