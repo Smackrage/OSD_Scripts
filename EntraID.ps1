@@ -1,9 +1,18 @@
 <#
 .SYNOPSIS
-  Entra ID stale device cleanup (WinForms): install Graph modules, preview/count, export CSV, delete.
+  Entra ID device cleanup (WinForms): preview devices older than X days, export CSV, remove devices.
+
+.REQUIREMENTS
+  Microsoft.Graph.Authentication
+  Microsoft.Graph.Identity.DirectoryManagement
+
+  Baseline connect (per request):
+    Connect-MgGraph -Scopes "User.Read.All","Group.ReadWrite.All"
+
+  Device preview query (per request):
+    Get-MgDevice -All | Where {$_.ApproximateLastSignInDateTime -le $dt} | select-object -Property ...
 
 .NOTES
-  Author: Martin Smith (Data #3) + ChatGPT
   Date: 15/12/2025
 #>
 
@@ -24,6 +33,7 @@ function Write-CMLog {
         $logPath = Get-LogPath
         $now = Get-Date
 
+        # CMTrace wants timezone offset appended to time (minutes)
         $offsetMinutes = [int]([System.TimeZoneInfo]::Local.GetUtcOffset($now).TotalMinutes)
         $offsetSign = if ($offsetMinutes -ge 0) { '+' } else { '-' }
         $offsetAbs = [math]::Abs($offsetMinutes)
@@ -44,11 +54,6 @@ function Write-CMLog {
 }
 
 function Invoke-Logged {
-    <#
-      Logs the command text and captures output/errors, logging each line.
-      Usage:
-        Invoke-Logged -Name "Connect Graph" -ScriptBlock { Connect-MgGraph ... } -VerboseToLog
-    #>
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
@@ -102,12 +107,180 @@ function Test-IsAdmin {
     } catch { return $false }
 }
 
-$form = New-Object System.Windows.Forms.Form
-$form.Text = "Entra ID Device Cleanup (Stale Devices)"
-$form.Width = 1050
-$form.Height = 820
-$form.StartPosition = "CenterScreen"
-$form.TopMost = $true
+function Add-UiLog {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [ValidateSet('1','2','3')][string]$Severity = '1'
+    )
+
+    $line = "[{0}] {1}" -f (Get-Date).ToString("HH:mm:ss"), $Text
+    Write-CMLog $Text $Severity
+
+    if ($script:Form -and $script:Form.IsHandleCreated) {
+        $script:Form.BeginInvoke([Action]{
+            $script:TxtLog.AppendText($line + [Environment]::NewLine)
+        }) | Out-Null
+    } else {
+        $script:UiLogBuffer.Add($line) | Out-Null
+    }
+}
+
+function Set-Status([string]$text) {
+    $script:LblStatus.Text = "Status: $text"
+    [System.Windows.Forms.Application]::DoEvents() | Out-Null
+}
+#endregion
+
+#region Graph prerequisites + connect (per your command)
+function Get-MissingGraphModules {
+    $required = @(
+        'Microsoft.Graph.Authentication',
+        'Microsoft.Graph.Identity.DirectoryManagement'
+    )
+    $missing = @()
+    foreach ($m in $required) {
+        if (-not (Get-Module -ListAvailable -Name $m)) { $missing += $m }
+    }
+    return $missing
+}
+
+function Import-GraphModules {
+    Invoke-Logged -Name "Import Graph modules" -ScriptBlock {
+        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop | Out-Null
+        Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop | Out-Null
+    } | Out-Null
+}
+
+# Baseline scopes as requested
+$script:BaseScopes = @("User.Read.All","Group.ReadWrite.All")
+
+function Connect-GraphWithScopes {
+    param(
+        [Parameter(Mandatory)][string[]]$Scopes
+    )
+
+    $scopeText = ($Scopes | Sort-Object -Unique) -join '","'
+    $cmdText = 'Connect-MgGraph -Scopes "{0}"' -f $scopeText
+
+    Add-UiLog "Connecting to Graph with scopes: $($Scopes -join ', ')" '1'
+    Invoke-Logged -Name "Connect-MgGraph" -VerboseToLog -ScriptBlock ([scriptblock]::Create($cmdText)) | Out-Null
+}
+
+function Ensure-GraphConnected {
+    param(
+        [string[]]$RequiredScopes
+    )
+
+    $want = @($script:BaseScopes + $RequiredScopes) | Sort-Object -Unique
+
+    $ctx = $null
+    try { $ctx = Get-MgContext -ErrorAction SilentlyContinue } catch {}
+
+    $connected = $ctx -and $ctx.Account -and $ctx.Scopes
+    $hasScopes = $false
+    if ($connected) {
+        $hasScopes = @($want | ForEach-Object { $ctx.Scopes -contains $_ }) -notcontains $false
+    }
+
+    if (-not $connected -or -not $hasScopes) {
+        Connect-GraphWithScopes -Scopes $want
+    } else {
+        Add-UiLog "Graph already connected as $($ctx.Account). Scopes OK." '1'
+    }
+}
+#endregion
+
+#region Non-blocking module install (child PowerShell + Timer)
+$script:InstallProcess = $null
+$script:InstallTimer   = New-Object System.Windows.Forms.Timer
+$script:InstallTimer.Interval = 250
+
+$script:InstallTimer.Add_Tick({
+    if (-not $script:InstallProcess) { return }
+
+    try {
+        while (-not $script:InstallProcess.StandardOutput.EndOfStream) {
+            $line = $script:InstallProcess.StandardOutput.ReadLine()
+            if ($line) { Add-UiLog "[INSTALL] $line" '1' }
+        }
+    } catch { Add-UiLog "StdOut read error: $($_.Exception.Message)" '2' }
+
+    try {
+        while (-not $script:InstallProcess.StandardError.EndOfStream) {
+            $err = $script:InstallProcess.StandardError.ReadLine()
+            if ($err) { Add-UiLog "[INSTALL-ERR] $err" '3' }
+        }
+    } catch { Add-UiLog "StdErr read error: $($_.Exception.Message)" '2' }
+
+    if ($script:InstallProcess.HasExited) {
+        $script:InstallTimer.Stop()
+
+        $exitCode = $script:InstallProcess.ExitCode
+        $script:InstallProcess.Dispose()
+        $script:InstallProcess = $null
+
+        $script:PrgInstall.Style = 'Blocks'
+
+        if ($exitCode -ne 0) {
+            Add-UiLog "Module install failed (exit code $exitCode)" '3'
+            $script:BtnInstallModules.Enabled = $true
+            $script:PrgInstall.Value = 0
+            Set-Status "Ready (modules missing)"
+            return
+        }
+
+        Add-UiLog "Graph module installation completed successfully." '1'
+        try {
+            Import-GraphModules
+            Add-UiLog "Graph modules imported." '1'
+
+            $script:BtnInstallModules.Enabled = $false
+            $script:PrgInstall.Value = 100
+
+            $script:BtnPreview.Enabled = $true
+            Set-Status "Ready (Graph installed)"
+        } catch {
+            Add-UiLog "Install succeeded but import failed: $($_.Exception.Message)" '3'
+            $script:BtnInstallModules.Enabled = $true
+            $script:PrgInstall.Value = 0
+            Set-Status "Ready (modules missing)"
+        }
+    }
+})
+#endregion
+
+#region Device operations (per your Get-MgDevice pipeline)
+function Get-StaleDevicesByPipeline {
+    param(
+        [Parameter(Mandatory)][datetime]$dt
+    )
+
+    # Exactly your requested pipeline + properties
+    Invoke-Logged -Name "Get-MgDevice stale device query" -ScriptBlock {
+        Get-MgDevice -All |
+            Where-Object { $_.ApproximateLastSignInDateTime -le $dt } |
+            Select-Object -Property AccountEnabled, DeviceId, OperatingSystem, OperatingSystemVersion, DisplayName, TrustType, ApproximateLastSignInDateTime, Id
+    }
+}
+
+function Remove-DeviceById {
+    param([Parameter(Mandatory)][string]$Id)
+
+    Invoke-Logged -Name "Remove-MgDevice -DeviceId $Id" -VerboseToLog -ScriptBlock {
+        Remove-MgDevice -DeviceId $Id -ErrorAction Stop -Verbose
+    } | Out-Null
+}
+#endregion
+
+#region UI Build
+$script:UiLogBuffer = New-Object System.Collections.Generic.List[string]
+
+$script:Form = New-Object System.Windows.Forms.Form
+$script:Form.Text = "Entra ID Device Cleanup (Stale Devices)"
+$script:Form.Width = 1050
+$script:Form.Height = 820
+$script:Form.StartPosition = "CenterScreen"
+$script:Form.TopMost = $true
 
 $lblDays = New-Object System.Windows.Forms.Label
 $lblDays.Text = "Devices older than (days):"
@@ -121,10 +294,10 @@ $numDays.Value = 90
 $numDays.Width = 90
 $numDays.Location = New-Object System.Drawing.Point(190, 12)
 
-$btnPreview = New-Object System.Windows.Forms.Button
-$btnPreview.Text = "Preview / Count"
-$btnPreview.Width = 140
-$btnPreview.Location = New-Object System.Drawing.Point(300, 10)
+$script:BtnPreview = New-Object System.Windows.Forms.Button
+$script:BtnPreview.Text = "Preview / Count"
+$script:BtnPreview.Width = 140
+$script:BtnPreview.Location = New-Object System.Drawing.Point(300, 10)
 
 $btnExport = New-Object System.Windows.Forms.Button
 $btnExport.Text = "Export CSV"
@@ -142,28 +315,28 @@ $chkWhatIf.AutoSize = $true
 $chkWhatIf.Checked = $true
 $chkWhatIf.Location = New-Object System.Drawing.Point(780, 13)
 
-$lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Text = "Status: Ready"
-$lblStatus.AutoSize = $true
-$lblStatus.Location = New-Object System.Drawing.Point(15, 45)
+$script:LblStatus = New-Object System.Windows.Forms.Label
+$script:LblStatus.Text = "Status: Ready"
+$script:LblStatus.AutoSize = $true
+$script:LblStatus.Location = New-Object System.Drawing.Point(15, 45)
 
-$btnInstallModules = New-Object System.Windows.Forms.Button
-$btnInstallModules.Text = "Install Graph Modules"
-$btnInstallModules.Width = 170
-$btnInstallModules.Location = New-Object System.Drawing.Point(300, 42)
+$script:BtnInstallModules = New-Object System.Windows.Forms.Button
+$script:BtnInstallModules.Text = "Install Graph Modules"
+$script:BtnInstallModules.Width = 170
+$script:BtnInstallModules.Location = New-Object System.Drawing.Point(300, 42)
 
 $btnElevate = New-Object System.Windows.Forms.Button
 $btnElevate.Text = "Restart as Administrator"
 $btnElevate.Width = 190
 $btnElevate.Location = New-Object System.Drawing.Point(900, 42)
 
-$prgInstall = New-Object System.Windows.Forms.ProgressBar
-$prgInstall.Width = 420
-$prgInstall.Height = 18
-$prgInstall.Location = New-Object System.Drawing.Point(480, 45)
-$prgInstall.Minimum = 0
-$prgInstall.Maximum = 100
-$prgInstall.Value = 0
+$script:PrgInstall = New-Object System.Windows.Forms.ProgressBar
+$script:PrgInstall.Width = 420
+$script:PrgInstall.Height = 18
+$script:PrgInstall.Location = New-Object System.Drawing.Point(480, 45)
+$script:PrgInstall.Minimum = 0
+$script:PrgInstall.Maximum = 100
+$script:PrgInstall.Value = 0
 
 $grid = New-Object System.Windows.Forms.DataGridView
 $grid.Location = New-Object System.Drawing.Point(15, 70)
@@ -176,246 +349,60 @@ $grid.AutoSizeColumnsMode = "Fill"
 $grid.SelectionMode = "FullRowSelect"
 $grid.MultiSelect = $true
 
-$txtInstallLog = New-Object System.Windows.Forms.TextBox
-$txtInstallLog.Multiline = $true
-$txtInstallLog.ScrollBars = "Vertical"
-$txtInstallLog.ReadOnly = $true
-$txtInstallLog.WordWrap = $false
-$txtInstallLog.Width = 1000
-$txtInstallLog.Height = 200
-$txtInstallLog.Location = New-Object System.Drawing.Point(15, 585)
+$script:TxtLog = New-Object System.Windows.Forms.TextBox
+$script:TxtLog.Multiline = $true
+$script:TxtLog.ScrollBars = "Vertical"
+$script:TxtLog.ReadOnly = $true
+$script:TxtLog.WordWrap = $false
+$script:TxtLog.Width = 1000
+$script:TxtLog.Height = 200
+$script:TxtLog.Location = New-Object System.Drawing.Point(15, 585)
 
-$form.Controls.AddRange(@(
-    $lblDays,$numDays,$btnPreview,$btnExport,$btnRemove,$chkWhatIf,
-    $lblStatus,$btnInstallModules,$prgInstall,$btnElevate,$grid,$txtInstallLog
+$script:Form.Controls.AddRange(@(
+    $lblDays,$numDays,$script:BtnPreview,$btnExport,$btnRemove,$chkWhatIf,
+    $script:LblStatus,$script:BtnInstallModules,$script:PrgInstall,$btnElevate,$grid,$script:TxtLog
 ))
 
-function Set-Status([string]$text) {
-    $lblStatus.Text = "Status: $text"
-    [System.Windows.Forms.Application]::DoEvents() | Out-Null
-}
-
-# Buffer UI log lines until form handle exists
-$script:UiLogBuffer = New-Object System.Collections.Generic.List[string]
-
-function Add-UiLog {
-    param(
-        [Parameter(Mandatory)][string]$Text,
-        [ValidateSet('1','2','3')][string]$Severity = '1'
-    )
-    $line = "[{0}] {1}" -f (Get-Date).ToString("HH:mm:ss"), $Text
-    Write-CMLog $Text $Severity
-
-    if ($form.IsHandleCreated) {
-        $form.BeginInvoke([Action]{
-            $txtInstallLog.AppendText($line + [Environment]::NewLine)
-        }) | Out-Null
-    } else {
-        [void]$script:UiLogBuffer.Add($line)
-    }
-}
-
-$form.Add_Shown({
+$script:Form.Add_Shown({
     if ($script:UiLogBuffer.Count -gt 0) {
-        foreach ($l in $script:UiLogBuffer) {
-            $txtInstallLog.AppendText($l + [Environment]::NewLine)
-        }
+        foreach ($l in $script:UiLogBuffer) { $script:TxtLog.AppendText($l + [Environment]::NewLine) }
         $script:UiLogBuffer.Clear()
     }
 })
-#endregion UI + Helpers
-
-#region Graph helpers (with command logging)
-function Get-MissingGraphModules {
-    $required = @(
-        'Microsoft.Graph.Authentication',
-        'Microsoft.Graph.Identity.DirectoryManagement'
-    )
-    $missing = @()
-    foreach ($m in $required) {
-        if (-not (Get-Module -ListAvailable -Name $m)) { $missing += $m }
-    }
-    return $missing
-}
-
-function Import-GraphModules {
-    Invoke-Logged -Name "Import Graph modules" -ScriptBlock {
-        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop | Out-Null
-        Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop | Out-Null
-    }
-}
-
-function Ensure-GraphConnection {
-    param([switch]$NeedWrite)
-
-    $needScopes = if ($NeedWrite) { @('Device.ReadWrite.All') } else { @('Device.Read.All') }
-
-    $ctx = $null
-    try { $ctx = Get-MgContext -ErrorAction SilentlyContinue } catch {}
-
-    $connected = $ctx -and $ctx.Account -and $ctx.Scopes
-    $hasScopes = $false
-
-    if ($connected) {
-        $hasScopes = @($needScopes | ForEach-Object { $ctx.Scopes -contains $_ }) -notcontains $false
-    }
-
-    if (-not $connected -or -not $hasScopes) {
-        Add-UiLog ("Connecting to Microsoft Graph with scopes: " + ($needScopes -join ", ")) '1'
-        Invoke-Logged -Name "Connect-MgGraph" -VerboseToLog -ScriptBlock {
-            Connect-MgGraph -Scopes $needScopes -ErrorAction Stop -Verbose
-        } | Out-Null
-    } else {
-        Add-UiLog "Graph already connected as $($ctx.Account). Scopes OK." '1'
-    }
-}
-
-function To-DeviceRowObject($d) {
-    [pscustomobject]@{
-        DisplayName = $d.DisplayName
-        DeviceId    = $d.DeviceId
-        ObjectId    = $d.Id
-        OS          = $d.OperatingSystem
-        OSVersion   = $d.OperatingSystemVersion
-        TrustType   = $d.TrustType
-        Enabled     = $d.AccountEnabled
-        LastSignIn  = $d.ApproximateLastSignInDateTime
-    }
-}
-
-function Get-StaleEntraDevices {
-    param([Parameter(Mandatory)][int]$OlderThanDays)
-
-    $cutoff = (Get-Date).AddDays(-1 * $OlderThanDays)
-    Add-UiLog "Cutoff date/time: $cutoff (older than $OlderThanDays days)" '1'
-
-    # Use server-side paging request (works reliably and is fast)
-    $iso = $cutoff.ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $filter = "approximateLastSignInDateTime le $iso"
-    Add-UiLog "Graph filter: $filter" '1'
-    Write-CMLog "COMMAND TEXT (Graph Request): Invoke-MgGraphRequest GET /devices?... filter=$filter" '1'
-
-    $uri = "/devices?`$select=id,deviceId,displayName,accountEnabled,operatingSystem,operatingSystemVersion,trustType,approximateLastSignInDateTime&`$filter=$([uri]::EscapeDataString($filter))&`$top=999"
-
-    $all  = New-Object System.Collections.Generic.List[object]
-    $next = $uri
-
-    do {
-        $resp = Invoke-Logged -Name "Invoke-MgGraphRequest (paged devices)" -ScriptBlock {
-            Invoke-MgGraphRequest -Method GET -Uri $next -Headers @{ 'ConsistencyLevel'='eventual' } -ErrorAction Stop
-        }
-        if ($resp.value) { $resp.value | ForEach-Object { [void]$all.Add($_) } }
-        $next = $resp.'@odata.nextLink'
-        if ($next) { Add-UiLog "Paging nextLink..." '1' }
-    } while ($next)
-
-    Add-UiLog "Returned $($all.Count) device(s) matching filter." '1'
-    return ,$all
-}
 #endregion
 
-#region Non-blocking module install via child PowerShell process + Timer polling
-$script:InstallProcess = $null
-$script:InstallTimer   = New-Object System.Windows.Forms.Timer
-$script:InstallTimer.Interval = 250
-
-$script:InstallTimer.Add_Tick({
-    if (-not $script:InstallProcess) { return }
-
-    # Drain stdout
-    try {
-        while (-not $script:InstallProcess.StandardOutput.EndOfStream) {
-            $line = $script:InstallProcess.StandardOutput.ReadLine()
-            if ($line) { Add-UiLog "[INSTALL] $line" '1' }
-        }
-    } catch {
-        Add-UiLog "StdOut read error: $($_.Exception.Message)" '2'
-    }
-
-    # Drain stderr
-    try {
-        while (-not $script:InstallProcess.StandardError.EndOfStream) {
-            $err = $script:InstallProcess.StandardError.ReadLine()
-            if ($err) { Add-UiLog "[INSTALL-ERR] $err" '3' }
-        }
-    } catch {
-        Add-UiLog "StdErr read error: $($_.Exception.Message)" '2'
-    }
-
-    if ($script:InstallProcess.HasExited) {
-        $script:InstallTimer.Stop()
-
-        $exitCode = $script:InstallProcess.ExitCode
-        $script:InstallProcess.Dispose()
-        $script:InstallProcess = $null
-
-        $prgInstall.Style = 'Blocks'
-
-        if ($exitCode -ne 0) {
-            Add-UiLog "Module install failed (exit code $exitCode)" '3'
-            $btnInstallModules.Enabled = $true
-            $prgInstall.Value = 0
-            Set-Status "Ready (modules missing)"
-            return
-        }
-
-        Add-UiLog "Graph module installation completed successfully." '1'
-        try {
-            Import-GraphModules
-            Add-UiLog "Graph modules imported." '1'
-            $btnInstallModules.Enabled = $false
-            $prgInstall.Value = 100
-            Set-GraphButtonsEnabled $true
-            Set-Status "Ready (Graph installed)"
-        } catch {
-            Add-UiLog "Install succeeded but import failed: $($_.Exception.Message)" '3'
-            $btnInstallModules.Enabled = $true
-            $prgInstall.Value = 0
-            Set-GraphButtonsEnabled $false
-            Set-Status "Ready (modules missing)"
-        }
-    }
-})
-#endregion
-
-#region App logic buttons (Preview/Export/Remove)
+#region Button wiring
 $script:PreviewDevices = @()
 
-function Set-GraphButtonsEnabled([bool]$enabled) {
-    $btnPreview.Enabled = $enabled
-    $btnExport.Enabled  = $enabled -and ($script:PreviewDevices.Count -gt 0)
-    $btnRemove.Enabled  = $enabled -and ($script:PreviewDevices.Count -gt 0)
+function Set-ButtonsAfterPreview {
+    $btnExport.Enabled = ($script:PreviewDevices.Count -gt 0)
+    $btnRemove.Enabled = ($script:PreviewDevices.Count -gt 0)
 }
 
 $btnElevate.Add_Click({
     try {
         Add-UiLog "Elevation requested. Relaunching as Administrator..." '2'
-
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = "powershell.exe"
         $psi.Arguments = "-STA -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
         $psi.Verb = "runas"
         $psi.UseShellExecute = $true
-
         [System.Diagnostics.Process]::Start($psi) | Out-Null
-        $form.Close()
+        $script:Form.Close()
     } catch {
         Add-UiLog "Elevation cancelled or failed: $($_.Exception.Message)" '2'
     }
 })
 
-$btnInstallModules.Add_Click({
+$script:BtnInstallModules.Add_Click({
     try {
-        if ($script:InstallProcess) {
-            Add-UiLog "Install already running..." '2'
-            return
-        }
+        if ($script:InstallProcess) { Add-UiLog "Install already running..." '2'; return }
 
         $missing = Get-MissingGraphModules
         if (-not $missing -or $missing.Count -eq 0) {
             Add-UiLog "Graph modules already installed." '1'
-            $btnInstallModules.Enabled = $false
-            Set-GraphButtonsEnabled $true
+            $script:BtnInstallModules.Enabled = $false
+            $script:BtnPreview.Enabled = $true
             Set-Status "Ready (Graph already installed)"
             return
         }
@@ -424,9 +411,7 @@ $btnInstallModules.Add_Click({
             Add-UiLog "Module install requires elevation. Click 'Restart as Administrator'." '2'
             [System.Windows.Forms.MessageBox]::Show(
                 "Installing Graph modules requires administrator privileges.`n`nClick 'Restart as Administrator' and try again.",
-                "Elevation required",
-                "OK",
-                "Warning"
+                "Elevation required","OK","Warning"
             ) | Out-Null
             return
         }
@@ -434,12 +419,13 @@ $btnInstallModules.Add_Click({
         Add-UiLog ("Missing modules: " + ($missing -join ", ")) '2'
         Add-UiLog "Starting module install process (non-blocking)..." '1'
 
-        $btnInstallModules.Enabled = $false
-        Set-GraphButtonsEnabled $false
+        $script:BtnInstallModules.Enabled = $false
+        $script:BtnPreview.Enabled = $false
+        $btnExport.Enabled = $false
+        $btnRemove.Enabled = $false
 
-        $prgInstall.Style = 'Marquee'
-        $prgInstall.MarqueeAnimationSpeed = 30
-        $prgInstall.Value = 0
+        $script:PrgInstall.Style = 'Marquee'
+        $script:PrgInstall.MarqueeAnimationSpeed = 30
         Set-Status "Installing Graph modules..."
 
         $modulesCsv = ($missing -join ',')
@@ -474,41 +460,43 @@ Write-Output "Install complete."
 
         $script:InstallProcess = [System.Diagnostics.Process]::Start($psi)
         $script:InstallTimer.Start()
-    }
-    catch {
+    } catch {
         Add-UiLog "Failed to start install: $($_.Exception.Message)" '3'
-        $btnInstallModules.Enabled = $true
-        $prgInstall.Style = 'Blocks'
-        $prgInstall.Value = 0
+        $script:BtnInstallModules.Enabled = $true
+        $script:PrgInstall.Style = 'Blocks'
+        $script:PrgInstall.Value = 0
         Set-Status "Ready (modules missing)"
     }
 })
 
-$btnPreview.Add_Click({
+$script:BtnPreview.Add_Click({
     try {
         Import-GraphModules
-        Ensure-GraphConnection
 
         $days = [int]$numDays.Value
-        Set-Status "Retrieving devices older than $days days..."
-        Add-UiLog "Preview clicked. Days=$days" '1'
+        $dt = (Get-Date).AddDays(-1 * $days)  # <- required for your requested pipeline
+        Add-UiLog "Preview clicked. Days=$days Cutoff(dt)=$dt" '1'
 
-        $stale = Get-StaleEntraDevices -OlderThanDays $days
-        $script:PreviewDevices = @($stale)
+        # Baseline connect (per request). If device read fails, retry with Device.Read.All.
+        try {
+            Ensure-GraphConnected -RequiredScopes @()   # baseline only
+            $devices = Get-StaleDevicesByPipeline -dt $dt
+        } catch {
+            Add-UiLog "Device query failed with baseline scopes. Retrying with Device.Read.All..." '2'
+            Ensure-GraphConnected -RequiredScopes @("Device.Read.All")
+            $devices = Get-StaleDevicesByPipeline -dt $dt
+        }
 
-        $rows = $script:PreviewDevices | ForEach-Object { To-DeviceRowObject $_ }
-        $grid.DataSource = $rows
+        $script:PreviewDevices = @($devices)
 
-        $count = $script:PreviewDevices.Count
-        Set-Status "Preview ready. Target count: $count"
-        Add-UiLog "Preview complete. Count=$count" '1'
-
-        $btnExport.Enabled = ($count -gt 0)
-        $btnRemove.Enabled = ($count -gt 0)
+        $grid.DataSource = $script:PreviewDevices
+        Add-UiLog "Preview complete. Count=$($script:PreviewDevices.Count)" '1'
+        Set-Status "Preview ready. Target count: $($script:PreviewDevices.Count)"
+        Set-ButtonsAfterPreview
     }
     catch {
+        Add-UiLog "Preview failed: $($_.Exception.Message)" '3'
         Set-Status "ERROR: $($_.Exception.Message)"
-        Add-UiLog ("Preview failed: " + $_.Exception.Message) '3'
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Preview failed", "OK", "Error") | Out-Null
     }
 })
@@ -523,21 +511,18 @@ $btnExport.Add_Click({
         $sfd = New-Object System.Windows.Forms.SaveFileDialog
         $sfd.Filter = "CSV (*.csv)|*.csv"
         $sfd.FileName = "entra-stale-devices-$((Get-Date).ToString('yyyyMMdd-HHmmss')).csv"
-
         if ($sfd.ShowDialog() -ne 'OK') { return }
 
-        Write-CMLog "COMMAND START: Export-Csv to $($sfd.FileName)" '1'
-        $export = $script:PreviewDevices | ForEach-Object { To-DeviceRowObject $_ }
-        $export | Export-Csv -Path $sfd.FileName -NoTypeInformation -Encoding UTF8
-        Write-CMLog "COMMAND END: Export-Csv (OK) Count=$($export.Count)" '1'
+        Invoke-Logged -Name "Export-Csv $($sfd.FileName)" -ScriptBlock {
+            $script:PreviewDevices | Export-Csv -Path $sfd.FileName -NoTypeInformation -Encoding UTF8
+        } | Out-Null
 
-        Add-UiLog "Exported CSV to $($sfd.FileName) (Count=$($export.Count))" '1'
+        Add-UiLog "Exported CSV: $($sfd.FileName)" '1'
         Set-Status "Exported CSV"
-        [System.Windows.Forms.MessageBox]::Show("Export complete:`n$($sfd.FileName)", "Export CSV", "OK", "Information") | Out-Null
     }
     catch {
+        Add-UiLog "Export failed: $($_.Exception.Message)" '3'
         Set-Status "ERROR: $($_.Exception.Message)"
-        Add-UiLog ("Export failed: " + $_.Exception.Message) '3'
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Export failed", "OK", "Error") | Out-Null
     }
 })
@@ -550,7 +535,9 @@ $btnRemove.Add_Click({
         }
 
         $count = $script:PreviewDevices.Count
+        $whatIf = $chkWhatIf.Checked
 
+        # Confirmation
         $confirm = New-Object System.Windows.Forms.Form
         $confirm.Text = "Confirm deletion"
         $confirm.Width = 520
@@ -588,18 +575,18 @@ $btnRemove.Add_Click({
         $confirm.AcceptButton = $ok
         $confirm.CancelButton = $cancel
 
-        $dr = $confirm.ShowDialog($form)
+        $dr = $confirm.ShowDialog($script:Form)
         if ($dr -ne 'OK') { return }
-
         if ($txt.Text -ne 'DELETE' -or -not $ack.Checked) {
             [System.Windows.Forms.MessageBox]::Show("Confirmation failed. No devices were removed.", "Remove", "OK", "Warning") | Out-Null
             return
         }
 
         Import-GraphModules
-        Ensure-GraphConnection -NeedWrite
 
-        $whatIf = $chkWhatIf.Checked
+        # Baseline connect first (per request). If delete fails, retry with Device.ReadWrite.All.
+        Ensure-GraphConnected -RequiredScopes @() # baseline only
+
         Add-UiLog "Remove clicked. Count=$count WhatIf=$whatIf" '2'
         Set-Status "Removing $count device(s)..."
 
@@ -607,38 +594,39 @@ $btnRemove.Add_Click({
         $failed  = 0
 
         foreach ($d in $script:PreviewDevices) {
-            $name  = $d.DisplayName
-            $objId = $d.Id
+            $name = $d.DisplayName
+            $id   = $d.Id
 
             try {
                 if ($whatIf) {
-                    Write-CMLog "COMMAND TEXT: [WhatIf] Remove-MgDevice -DeviceId $objId" '1'
-                    Add-UiLog "[WhatIf] Would remove: $name ($objId)" '1'
+                    Write-CMLog "COMMAND TEXT: [WhatIf] Remove-MgDevice -DeviceId $id" '1'
+                    Add-UiLog "[WhatIf] Would remove: $name ($id)" '1'
                 } else {
-                    Invoke-Logged -Name "Remove-MgDevice ($name)" -VerboseToLog -ScriptBlock {
-                        Remove-MgDevice -DeviceId $objId -ErrorAction Stop -Verbose
-                    } | Out-Null
-                    Add-UiLog "Removed: $name ($objId)" '1'
+                    try {
+                        Remove-DeviceById -Id $id
+                    } catch {
+                        Add-UiLog "Delete failed with baseline scopes. Retrying with Device.ReadWrite.All..." '2'
+                        Ensure-GraphConnected -RequiredScopes @("Device.ReadWrite.All")
+                        Remove-DeviceById -Id $id
+                    }
+                    Add-UiLog "Removed: $name ($id)" '1'
                 }
                 $removed++
-            }
-            catch {
+            } catch {
                 $failed++
-                Add-UiLog ("FAILED removing $name ($objId): " + $_.Exception.Message) '3'
+                Add-UiLog "FAILED removing $name ($id): $($_.Exception.Message)" '3'
             }
         }
 
         if ($whatIf) {
             Set-Status "WhatIf complete. Would remove: $removed. Failed: $failed"
-            [System.Windows.Forms.MessageBox]::Show("WhatIf complete.`nWould remove: $removed`nFailures: $failed", "Remove (WhatIf)", "OK", "Information") | Out-Null
         } else {
             Set-Status "Removal complete. Removed: $removed. Failed: $failed"
-            [System.Windows.Forms.MessageBox]::Show("Removal complete.`nRemoved: $removed`nFailures: $failed", "Remove", "OK", "Information") | Out-Null
         }
     }
     catch {
+        Add-UiLog "Remove failed: $($_.Exception.Message)" '3'
         Set-Status "ERROR: $($_.Exception.Message)"
-        Add-UiLog ("Remove failed: " + $_.Exception.Message) '3'
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Remove failed", "OK", "Error") | Out-Null
     }
 })
@@ -648,7 +636,7 @@ $btnRemove.Add_Click({
 Add-UiLog "Launching UI..." '1'
 Add-UiLog "Log file: $(Get-LogPath)" '1'
 
-$script:PreviewDevices = @()
+# Disable until ready
 $btnExport.Enabled = $false
 $btnRemove.Enabled = $false
 
@@ -664,21 +652,24 @@ if (Test-IsAdmin) {
 $missingAtStart = Get-MissingGraphModules
 if ($missingAtStart.Count -gt 0) {
     Add-UiLog ("Graph modules missing: " + ($missingAtStart -join ", ")) '2'
-    $btnInstallModules.Enabled = $true
-    Set-GraphButtonsEnabled $false
+    $script:BtnInstallModules.Enabled = $true
+    $script:BtnPreview.Enabled = $false
     Set-Status "Ready (modules missing)"
 } else {
     try {
         Import-GraphModules
         Add-UiLog "Graph modules present and imported." '1'
+        $script:BtnInstallModules.Enabled = $false
+        $script:BtnPreview.Enabled = $true
+        Set-Status "Ready"
     } catch {
-        Add-UiLog ("Graph import error: " + $_.Exception.Message) '2'
+        Add-UiLog "Graph import failed: $($_.Exception.Message)" '3'
+        $script:BtnInstallModules.Enabled = $true
+        $script:BtnPreview.Enabled = $false
+        Set-Status "Ready (modules missing)"
     }
-    $btnInstallModules.Enabled = $false
-    Set-GraphButtonsEnabled $true
-    Set-Status "Ready"
 }
 #endregion
 
-[void]$form.ShowDialog()
+[void]$script:Form.ShowDialog()
 Write-CMLog "UI closed." '1'
